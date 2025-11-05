@@ -42,3 +42,4 @@
 
 # Ignore local emsdk checkout
 tools/emsdk/
+node_modules/
