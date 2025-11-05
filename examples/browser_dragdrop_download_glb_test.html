@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta http-equiv="content-type" content="text/html;charset=utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no">
+
+    <title>AssimpJS GLB Download Demo</title>
+    <script type="text/javascript" src="../dist/assimpjs-all.js"></script>
+    
+    <script type='text/javascript'>
+		function GetFileBuffer (file)
+		{
+			return new Promise ((resolve, reject) => {
+				let reader = new FileReader ();
+				reader.onloadend = function (event) {
+					if (event.target.readyState === FileReader.DONE) {
+						resolve (event.target.result);
+					}
+				};
+				reader.onerror = function () {
+					reject ();
+				};
+				reader.readAsArrayBuffer (file);
+			});		
+		}
+		
+		function DownloadFile(content, filename, contentType) {
+			const blob = new Blob([content], { type: contentType });
+			const url = URL.createObjectURL(blob);
+			const link = document.createElement('a');
+			link.href = url;
+			link.download = filename;
+			document.body.appendChild(link);
+			link.click();
+			document.body.removeChild(link);
+			URL.revokeObjectURL(url);
+		}
+		
+		function LoadModel (ajs, files, onLoad)
+		{
+			let downloadFiles = [];
+			for (let i = 0; i < files.length; i++) {
+				downloadFiles.push (GetFileBuffer (files[i]));
+			}
+			Promise.all (downloadFiles).then ((arrayBuffers) => {
+				// create new file list object, and add the files
+				let fileList = new ajs.FileList ();
+				for (let i = 0; i < arrayBuffers.length; i++) {
+					fileList.AddFile (files[i].name, new Uint8Array (arrayBuffers[i]));
+				}
+
+				// convert file list to GLB2 format
+				let result = ajs.ConvertFileList (fileList, 'glb2');
+
+				// check if the conversion succeeded
+				if (!result.IsSuccess () || result.FileCount () == 0) {
+					onLoad (`Conversion failed with error code: ${result.GetErrorCode ()}`);
+					return;
+				}
+
+				// get the first result file (GLB is a single file format)
+				let resultFile = result.GetFile(0);
+				let filename = resultFile.GetPath();
+				
+				// Ensure .glb extension
+				if (!filename.toLowerCase().endsWith('.glb')) {
+					filename = filename.replace(/\.[^/.]+$/, "") + '.glb';
+				}
+				
+				// If we have multiple input files, use a generic name
+				if (files.length > 1) {
+					filename = 'converted_model.glb';
+				} else {
+					// Use original filename base for single file
+					let baseName = files[0].name.replace(/\.[^/.]+$/, "");
+					filename = `${baseName}.glb`;
+				}
+				
+				// Download the GLB file
+				DownloadFile(resultFile.GetContent(), filename, 'application/octet-stream');
+				onLoad (`Successfully converted and downloaded ${filename}.`);
+			}).catch((error) => {
+				onLoad (`Error processing files: ${error}`);
+			});
+		}
+	
+        window.onload = function () {
+			let resultDiv = document.getElementById ('result');
+			resultDiv.innerHTML = 'Loading assimp.js...';
+			assimpjs ().then (function (ajs) {
+				resultDiv.innerHTML = 'Drag&Drop your 3D model files here to convert and download as GLB.';
+				window.addEventListener ('dragstart', (ev) => {
+					ev.preventDefault ();
+				}, false);
+				window.addEventListener ('dragover', (ev) => {
+					ev.stopPropagation ();
+					ev.preventDefault ();
+					ev.dataTransfer.dropEffect = 'copy';
+				}, false);
+				window.addEventListener ('drop', (ev) => {
+					ev.stopPropagation ();
+					ev.preventDefault ();
+					if (ev.dataTransfer.files.length > 0) {
+						resultDiv.innerHTML = 'Converting models to GLB format...';
+						LoadModel (ajs, ev.dataTransfer.files, (result) => {
+							resultDiv.innerHTML = result;
+						});
+					}
+				}, false);
+			});
+        };
+    </script>
+</head>
+
+<body>
+	<h1>AssimpJS GLB Download Demo</h1>
+	<p>This demo converts uploaded 3D models to GLB format and automatically downloads them to your computer.</p>
+	<div id="result" style="padding: 20px; border: 2px dashed #ccc; margin: 20px 0; min-height: 100px; font-family: monospace;"></div>
+</body>
+
+</html>

@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html;charset=utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=no" />
+
+    <title>AssimpJS GLB Convert & Export (Three.js Viewer)</title>
+
+    <!-- AssimpJS builds: importer (all) and exporter -->
+    <script type="text/javascript" src="../dist/assimpjs-all.js"></script>
+    <script>
+      window.assimpjsImporter = assimpjs;
+    </script>
+    <script type="text/javascript" src="../dist/assimpjs-exporter.js"></script>
+    <script>
+      window.assimpjsExporter = assimpjs;
+    </script>
+
+    <!-- Three.js + loaders + controls from CDNJS (non-module r128 to avoid ORB blocking) -->
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <style>
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 12px;
+      }
+      .container {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 12px;
+        padding: 12px;
+      }
+      .panel {
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        padding: 12px;
+      }
+      #dropzone {
+        padding: 20px;
+        border: 2px dashed #ccc;
+        min-height: 120px;
+        text-align: center;
+        color: #666;
+      }
+      #viewer {
+        width: 100%;
+        height: 540px;
+        background: #111;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      #formats {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 6px;
+      }
+      #formats label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+      }
+      #result {
+        font-family: monospace;
+        white-space: pre-wrap;
+        font-size: 12px;
+        color: #333;
+      }
+      button {
+        padding: 8px 12px;
+        border-radius: 6px;
+        border: 1px solid #ccc;
+        background: #fafafa;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .toast {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.8);
+        color: #fff;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 13px;
+        z-index: 9999;
+      }
+    </style>
+
+    <script type="text/javascript">
+      // Common helpers
+      function GetFileBuffer(file) {
+        return new Promise((resolve, reject) => {
+          let reader = new FileReader();
+          reader.onloadend = function (event) {
+            if (event.target.readyState === FileReader.DONE) {
+              resolve(event.target.result);
+            }
+          };
+          reader.onerror = function () {
+            reject("FileReader error");
+          };
+          reader.readAsArrayBuffer(file);
+        });
+      }
+
+      function DownloadFile(content, filename, contentType) {
+        const blob = new Blob([content], { type: contentType });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+
+      // 上传允许的3D格式（扩展名，不区分大小写）
+      const AllowedInputExtensions = [
+        "obj",
+        "fbx",
+        "usdz",
+        "stl",
+        "glb",
+        "3mf",
+        "ply",
+        "vox",
+        "gltf",
+        "usda",
+        "usdc",
+      ];
+
+      // 导出格式选项（仅 OBJ / USDZ / STL / GLB / PLY）
+      const ExportFormatOptions = [
+        { label: "OBJ", value: "obj", kind: "assimp" },
+        { label: "USDZ", value: "usdz", kind: "usdz" },
+        { label: "STL", value: "stl", kind: "assimp" },
+        { label: "GLB", value: "glb2", kind: "assimp" },
+        { label: "PLY", value: "ply", kind: "assimp" },
+      ];
+
+      // Three.js viewer state
+      let scene, camera, renderer, controls, currentModel;
+
+      function initViewer() {
+        const canvasContainer = document.getElementById("viewer");
+        const width = canvasContainer.clientWidth;
+        const height = canvasContainer.clientHeight;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        canvasContainer.appendChild(renderer.domElement);
+
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+
+        camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 1000);
+        camera.position.set(2, 2, 2);
+
+        if (THREE && typeof THREE.OrbitControls === "function") {
+          try {
+            const OC = THREE.OrbitControls;
+            try {
+              controls = new OC(camera, renderer.domElement);
+            } catch (e1) {
+              // fallback: some builds expose as function not class
+              controls = OC(camera, renderer.domElement);
+            }
+            if (controls && typeof controls.update === "function") {
+              controls.enableDamping = true;
+            } else {
+              appendResult("OrbitControls 不可用，使用基本视图。");
+              controls = { update: function () {} };
+            }
+          } catch (e) {
+            appendResult("OrbitControls 构造失败，使用基本视图。");
+            controls = { update: function () {} };
+          }
+        } else {
+          appendResult("OrbitControls 未加载，使用基本视图。");
+          controls = { update: function () {} };
+        }
+
+        const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambient);
+        const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+        dir.position.set(5, 10, 7.5);
+        scene.add(dir);
+
+        window.addEventListener("resize", () => {
+          const w = canvasContainer.clientWidth;
+          const h = canvasContainer.clientHeight;
+          renderer.setSize(w, h);
+          camera.aspect = w / h;
+          camera.updateProjectionMatrix();
+        });
+
+        function animate() {
+          requestAnimationFrame(animate);
+          controls.update();
+          renderer.render(scene, camera);
+        }
+        animate();
+      }
+
+      function showGLBInViewer(glbUint8Array) {
+        // Dispose previous model
+        if (currentModel) {
+          scene.remove(currentModel);
+          currentModel.traverse((obj) => {
+            if (obj.isMesh) {
+              obj.geometry.dispose();
+              if (obj.material.map) obj.material.map.dispose();
+              obj.material.dispose();
+            }
+          });
+          currentModel = null;
+        }
+        const blob = new Blob([glbUint8Array], { type: "model/gltf-binary" });
+        const url = URL.createObjectURL(blob);
+        const loader = new THREE.GLTFLoader();
+        loader.load(
+          url,
+          (gltf) => {
+            currentModel = gltf.scene || gltf.scenes[0];
+            scene.add(currentModel);
+            // frame the model
+            const box = new THREE.Box3().setFromObject(currentModel);
+            const size = box.getSize(new THREE.Vector3()).length();
+            const center = box.getCenter(new THREE.Vector3());
+            controls.reset();
+            camera.near = size / 100;
+            camera.far = size * 100;
+            camera.updateProjectionMatrix();
+            camera.position
+              .copy(center)
+              .add(new THREE.Vector3(size / 2.0, size / 5.0, size / 2.0));
+            controls.target.copy(center);
+            controls.update();
+            URL.revokeObjectURL(url);
+          },
+          undefined,
+          (err) => {
+            appendResult(`Three.js GLTFLoader error: ${err}`);
+            URL.revokeObjectURL(url);
+          }
+        );
+      }
+
+      function appendResult(msg) {
+        const resultDiv = document.getElementById("result");
+        resultDiv.textContent += `\n${msg}`;
+      }
+
+      function showToast(message, duration = 2000) {
+        const toast = document.createElement("div");
+        toast.className = "toast";
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+          document.body.removeChild(toast);
+        }, duration);
+      }
+
+      function isAllowed3DExtension(filename) {
+        const m = filename.toLowerCase().match(/\.([a-z0-9]+)$/);
+        if (!m) return false;
+        const ext = m[1];
+        return AllowedInputExtensions.includes(ext);
+      }
+
+      function filterAllowedFiles(fileList) {
+        const files = Array.from(fileList);
+        const unsupported = files.filter((f) => !isAllowed3DExtension(f.name));
+        if (unsupported.length > 0) {
+          const names = unsupported.map((f) => f.name).join(", ");
+          showToast(`不支持的格式：${names}`);
+          appendResult(`拦截不支持的文件：${names}`);
+          return null;
+        }
+        return files;
+      }
+
+      async function handleFiles(files) {
+        const dropzone = document.getElementById("dropzone");
+        const exportBtn = document.getElementById("exportBtn");
+        const formatInputs = document.querySelectorAll(
+          "#formats input[type=checkbox]"
+        );
+        const status = document.getElementById("status");
+
+        // 拦截不支持的上传格式
+        const allowed = filterAllowedFiles(files);
+        if (!allowed) {
+          status.textContent = "等待文件中...";
+          return;
+        }
+
+        status.textContent = "加载 AssimpJS 模块中...";
+        try {
+          const ajsImporter = await window.assimpjsImporter();
+          const ajsExporter = await window.assimpjsExporter();
+
+          status.textContent = "读取文件...";
+          const buffers = await Promise.all(allowed.map(GetFileBuffer));
+
+          // Build FileList for importer
+          let fileList = new ajsImporter.FileList();
+          for (let i = 0; i < buffers.length; i++) {
+            fileList.AddFile(allowed[i].name, new Uint8Array(buffers[i]));
+          }
+
+          status.textContent = "先转换为 GLB2...";
+          const glbResult = ajsImporter.ConvertFileList(fileList, "glb2");
+          if (!glbResult.IsSuccess() || glbResult.FileCount() === 0) {
+            appendResult(`转换GLB失败，错误码: ${glbResult.GetErrorCode()}`);
+            status.textContent = "转换失败";
+            return;
+          }
+
+          // GLB is single file
+          const glbFile = glbResult.GetFile(0);
+          const glbContent = glbFile.GetContent();
+
+          // Viewer preview
+          status.textContent = "Three.js 渲染预览中...";
+          showGLBInViewer(glbContent);
+          appendResult("GLB 转换成功，已渲染预览。");
+
+          // Enable export UI
+          exportBtn.disabled = false;
+          dropzone.dataset.hasGlb = "1";
+          dropzone.glbContent = glbContent; // stash for export
+
+          exportBtn.onclick = () => {
+            const selected = Array.from(formatInputs)
+              .filter((i) => i.checked)
+              .map((i) => i.value);
+            if (selected.length === 0) {
+              appendResult("未选择导出格式。");
+              return;
+            }
+            status.textContent = "GLB 正在导出为所选格式...";
+
+            // Build GLB-only FileList for exporter
+            let glbListForExport = new ajsExporter.FileList();
+            // Use a stable name for GLB input
+            glbListForExport.AddFile("result.glb", glbContent);
+
+            // Export one-by-one to keep memory low and results clear
+            (async function doExportSequential() {
+              for (const fmt of selected) {
+                if (fmt === "usdz") {
+                  appendResult("正在导出为 USDZ (Three.js 模块版导出器)…");
+                  try {
+                    await exportUSDZ(glbContent);
+                    appendResult("导出 usdz 完成。");
+                  } catch (e) {
+                    appendResult(`导出 usdz 失败：${e}`);
+                  }
+                  continue;
+                }
+                appendResult(`正在导出为 ${fmt} ...`);
+                const out = ajsExporter.ConvertFileList(glbListForExport, fmt);
+                if (!out.IsSuccess() || out.FileCount() === 0) {
+                  appendResult(
+                    `导出 ${fmt} 失败，错误码: ${out.GetErrorCode()}`
+                  );
+                  continue;
+                }
+                for (let i = 0; i < out.FileCount(); i++) {
+                  const f = out.GetFile(i);
+                  const path = f.GetPath();
+                  const content = f.GetContent();
+                  // content-type 一律 octet-stream，防止浏览器误处理
+                  DownloadFile(content, path, "application/octet-stream");
+                }
+                appendResult(`导出 ${fmt} 完成。`);
+              }
+              status.textContent = "导出完成";
+            })();
+          };
+
+          status.textContent = "已准备好导出。";
+        } catch (err) {
+          appendResult(`运行时错误: ${err}`);
+          status.textContent = "错误";
+        }
+      }
+
+      window.onload = function () {
+        initViewer();
+        const dropzone = document.getElementById("dropzone");
+        const status = document.getElementById("status");
+        const formatsDiv = document.getElementById("formats");
+        const fileInput = document.getElementById("fileInput");
+        const selectBtn = document.getElementById("selectBtn");
+
+        // Build format checkboxes（仅显示目标导出五类）
+        for (const opt of ExportFormatOptions) {
+          const id = `fmt_${opt.value}`;
+          const label = document.createElement("label");
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.value = opt.value;
+          input.id = id;
+          // Preselect a few common formats
+          if (["glb2", "obj", "stl", "ply"].includes(opt.value))
+            input.checked = true;
+          const span = document.createElement("span");
+          span.textContent = opt.label;
+          label.appendChild(input);
+          label.appendChild(span);
+          formatsDiv.appendChild(label);
+        }
+
+        dropzone.textContent =
+          "拖拽或选择 3D 模型文件（支持 OBJ/FBX/USDZ/STL/GLB/3MF/PLY/VOX/GLTF），先转 GLB 再导出（并预览）";
+
+        // 选择上传按钮
+        selectBtn.addEventListener("click", () => fileInput.click());
+        fileInput.addEventListener("change", (ev) => {
+          if (ev.target.files && ev.target.files.length > 0) {
+            document.getElementById("result").textContent = "";
+            status.textContent = "开始转换...";
+            handleFiles(ev.target.files);
+            // reset input so same file can be chosen again
+            ev.target.value = "";
+          }
+        });
+
+        window.addEventListener(
+          "dragstart",
+          (ev) => {
+            ev.preventDefault();
+          },
+          false
+        );
+        window.addEventListener(
+          "dragover",
+          (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault();
+            ev.dataTransfer.dropEffect = "copy";
+          },
+          false
+        );
+        window.addEventListener(
+          "drop",
+          (ev) => {
+            ev.stopPropagation();
+            ev.preventDefault();
+            if (ev.dataTransfer.files.length > 0) {
+              document.getElementById("result").textContent = "";
+              status.textContent = "开始转换...";
+              handleFiles(ev.dataTransfer.files);
+            }
+          },
+          false
+        );
+      };
+
+      // 使用 Three.js 模块版 USDZExporter 做 USDZ 导出（与页面非模块版 viewer 并存）
+      async function exportUSDZ(glbUint8Array) {
+        return new Promise((resolve, reject) => {
+          // 暂存 GLB Blob URL 给模块脚本使用
+          const blob = new Blob([glbUint8Array], { type: "model/gltf-binary" });
+          const url = URL.createObjectURL(blob);
+          window.__glbBlobUrlForUSDZ = url;
+          window.__usdzResolve = (ab) => {
+            try {
+              // 下载 USDZ
+              DownloadFile(
+                new Uint8Array(ab),
+                "model.usdz",
+                "application/octet-stream"
+              );
+              resolve();
+            } catch (e) {
+              reject(e);
+            } finally {
+              URL.revokeObjectURL(url);
+              delete window.__glbBlobUrlForUSDZ;
+              delete window.__usdzResolve;
+            }
+          };
+          window.__usdzReject = (e) => {
+            URL.revokeObjectURL(url);
+            delete window.__glbBlobUrlForUSDZ;
+            delete window.__usdzResolve;
+            delete window.__usdzReject;
+            reject(e);
+          };
+
+          const mod = document.createElement("script");
+          mod.type = "module";
+          mod.textContent = `
+            (async () => {
+              try {
+                const THREE = await import('https://unpkg.com/three@0.152.2/build/three.module.js');
+                const { GLTFLoader } = await import('https://unpkg.com/three@0.152.2/examples/jsm/loaders/GLTFLoader.js');
+                const { USDZExporter } = await import('https://unpkg.com/three@0.152.2/examples/jsm/exporters/USDZExporter.js');
+                const loader = new GLTFLoader();
+                const gltf = await new Promise((res, rej) => loader.load(window.__glbBlobUrlForUSDZ, res, undefined, rej));
+                const exporter = new USDZExporter();
+                const arrayBuffer = await exporter.parseAsync(gltf.scene);
+                window.__usdzResolve && window.__usdzResolve(arrayBuffer);
+              } catch (e) {
+                window.__usdzReject && window.__usdzReject(e);
+              } finally {
+                // 清理模块脚本本身
+                const s = document.currentScript;
+                s && s.parentNode && s.parentNode.removeChild(s);
+              }
+            })();
+          `;
+          document.body.appendChild(mod);
+        });
+      }
+    </script>
+  </head>
+  <body>
+    <h1>AssimpJS：其他所有格式先转 GLB，再导出其他所有格式（Three.js 预览）</h1>
+    <div class="container">
+      <div class="panel">
+        <div id="dropzone"></div>
+        <div
+          style="margin-top: 8px; display: flex; gap: 8px; align-items: center"
+        >
+          <button id="selectBtn">选择文件</button>
+          <input
+            id="fileInput"
+            type="file"
+            multiple
+            style="display: none"
+            accept=".obj,.fbx,.usdz,.stl,.glb,.3mf,.ply,.vox,.gltf,.usda,.usdc"
+          />
+          <span style="font-size: 12px; color: #666"
+            >仅支持 OBJ/FBX/USDZ/STL/GLB/3MF/PLY/VOX/GLTF</span
+          >
+        </div>
+        <p id="status" style="margin: 10px 0">等待文件中...</p>
+        <h3 style="margin-top: 16px">
+          选择导出格式（OBJ / USDZ / STL / GLB / PLY）
+        </h3>
+        <div id="formats"></div>
+        <div style="margin-top: 12px; display: flex; gap: 8px">
+          <button id="exportBtn" disabled>导出所选格式</button>
+        </div>
+        <div id="result" style="margin-top: 12px"></div>
+      </div>
+      <div class="panel">
+        <div id="viewer"></div>
+      </div>
+    </div>
+  </body>
+</html>

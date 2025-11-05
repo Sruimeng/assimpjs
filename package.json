@@ -1,0 +1,52 @@
+{
+	"name": "assimpjs",
+	"version": "0.0.11",
+	"description": "Javascript interface for the assimp library.",
+	"license": "MIT",
+	"main": "./dist/assimpjs-mini.js",
+	"repository": "github:kovacsv/assimpjs",
+	"keywords": [
+		"assimp",
+		"3d",
+		"model",
+		"converter"
+	],
+	"exports": {
+		".": {
+			"import": "./dist/assimpjs-mini.js",
+			"require": "./dist/assimpjs-mini.js",
+			"default": "./dist/assimpjs-mini.js"
+		},
+		"./all": {
+			"import": "./dist/assimpjs-all.js",
+			"require": "./dist/assimpjs-all.js",
+			"default": "./dist/assimpjs-all.js"
+		},
+		"./exporter": {
+			"import": "./dist/assimpjs-exporter.js",
+			"require": "./dist/assimpjs-exporter.js",
+			"default": "./dist/assimpjs-exporter.js"
+		}
+	},
+	"files": [
+		"dist/**/*",
+		"LICENSE.md",
+		"README.md"
+	],
+	"devDependencies": {
+		"http-server": "^14.1.1",
+		"mocha": "^8.3.2"
+	},
+	"scripts": {
+		"start": "http-server",
+		"test": "mocha test --timeout 30000",
+		"build": "tools/build_wasm_deb.sh all",
+		"build:mini": "tools/build_wasm_deb.sh ReleaseMini",
+		"build:all": "tools/build_wasm_deb.sh ReleaseAll",
+		"build:exporter": "tools/build_wasm_deb.sh ReleaseExporter",
+		"clean": "tools/build_wasm_deb.sh clean",
+		"clean:mini": "tools/build_wasm_deb.sh clean-mini",
+		"clean:all": "tools/build_wasm_deb.sh clean-all",
+		"clean:exporter": "tools/build_wasm_deb.sh clean-exporter"
+	}
+}
