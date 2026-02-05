@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="content-type" content="text/html;charset=utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=no" />
+
+    <title>AssimpJS Meshopt Demo</title>
+    <script type="text/javascript" src="dist/assimpjs-meshopt.js"></script>
+    <link rel="stylesheet" type="text/css" href="source/meshopt-demo.css" />
+    <script type="text/javascript" src="source/meshopt-demo.js" defer></script>
+  </head>
+
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="tag">assimpjs meshopt wasm</div>
+        <h1>Meshopt GLB + FBX Conversion Lab</h1>
+        <p>
+          Validate the latest meshopt-enabled WASM build. Drop a GLB (including
+          EXT_meshopt_compression) or FBX file, then export to OBJ, STL, USD,
+          FBX, GLB, or 3MF.
+        </p>
+        <div class="chip-row">
+          <div class="chip">glb + meshopt</div>
+          <div class="chip">fbx import</div>
+          <div class="chip">obj/stl/usd/glb/3mf</div>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="column">
+          <div class="panel dropzone" id="dropzone">
+            <h2>Drop model files</h2>
+            <p>
+              Multi-file glTF is supported. Make sure the main file is GLB, GLTF,
+              or FBX.
+            </p>
+            <input
+              id="fileInput"
+              class="file-input"
+              type="file"
+              multiple
+              accept=".glb,.gltf,.fbx,.bin,.png,.jpg,.jpeg,.ktx2"
+            />
+            <div class="file-list" id="fileList"></div>
+          </div>
+
+          <div class="panel options">
+            <h3>Export format</h3>
+            <div class="format-grid">
+              <label class="format-option">
+                <input type="radio" name="format" value="obj" checked /> OBJ
+              </label>
+              <label class="format-option">
+                <input type="radio" name="format" value="stl" /> STL
+              </label>
+              <label class="format-option">
+                <input type="radio" name="format" value="usd" /> USD
+              </label>
+              <label class="format-option">
+                <input type="radio" name="format" value="fbx" /> FBX
+              </label>
+              <label class="format-option">
+                <input type="radio" name="format" value="glb2" /> GLB
+              </label>
+              <label class="format-option">
+                <input type="radio" name="format" value="3mf" /> 3MF
+              </label>
+            </div>
+            <div class="actions">
+              <button id="convertBtn">Convert</button>
+              <button id="clearBtn" class="ghost">Clear</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="column">
+          <div class="panel">
+            <div class="status-row">
+              <span>Status</span>
+              <div id="status" data-tone="idle">Loading wasm...</div>
+            </div>
+            <div class="log" id="log"></div>
+            <div class="outputs" id="outputs"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

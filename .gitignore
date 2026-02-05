@@ -39,7 +39,13 @@
 
 # debug information files
 *.dwo
-
+.cache
 # Ignore local emsdk checkout
 tools/emsdk/
 node_modules/
+build
+temp
+build_wasm_all
+build_wasm_exporter
+build_wasm_meshopt
+build_wasm_mini

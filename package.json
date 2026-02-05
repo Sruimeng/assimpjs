@@ -26,6 +26,11 @@
 			"import": "./dist/assimpjs-exporter.js",
 			"require": "./dist/assimpjs-exporter.js",
 			"default": "./dist/assimpjs-exporter.js"
+		},
+		"./meshopt": {
+			"import": "./dist/assimpjs-meshopt.js",
+			"require": "./dist/assimpjs-meshopt.js",
+			"default": "./dist/assimpjs-meshopt.js"
 		}
 	},
 	"files": [
@@ -44,9 +49,11 @@
 		"build:mini": "tools/build_wasm_deb.sh ReleaseMini",
 		"build:all": "tools/build_wasm_deb.sh ReleaseAll",
 		"build:exporter": "tools/build_wasm_deb.sh ReleaseExporter",
+		"build:meshopt": "tools/build_wasm_deb.sh ReleaseMeshopt",
 		"clean": "tools/build_wasm_deb.sh clean",
 		"clean:mini": "tools/build_wasm_deb.sh clean-mini",
 		"clean:all": "tools/build_wasm_deb.sh clean-all",
-		"clean:exporter": "tools/build_wasm_deb.sh clean-exporter"
+		"clean:exporter": "tools/build_wasm_deb.sh clean-exporter",
+		"clean:meshopt": "tools/build_wasm_deb.sh clean-meshopt"
 	}
 }

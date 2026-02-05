@@ -1,14 +1,14 @@
 @echo off
 pushd %~dp0\..
 
-REM Support ReleaseMini, ReleaseAll, ReleaseExporter, all, clean, or individual clean options
+REM Support ReleaseMini, ReleaseAll, ReleaseExporter, ReleaseMeshopt, all, clean, or individual clean options
 set BUILD_TYPE=%1
 if "%BUILD_TYPE%"=="" set BUILD_TYPE=ReleaseMini
 
 REM Validate build type
-if not "%BUILD_TYPE%"=="ReleaseMini" if not "%BUILD_TYPE%"=="ReleaseAll" if not "%BUILD_TYPE%"=="ReleaseExporter" if not "%BUILD_TYPE%"=="all" if not "%BUILD_TYPE%"=="clean" if not "%BUILD_TYPE%"=="clean-mini" if not "%BUILD_TYPE%"=="clean-all" if not "%BUILD_TYPE%"=="clean-exporter" (
-    echo Error: Only ReleaseMini, ReleaseAll, ReleaseExporter, all, clean, clean-mini, clean-all, or clean-exporter are supported
-    echo Usage: %0 [ReleaseMini^|ReleaseAll^|ReleaseExporter^|all^|clean^|clean-mini^|clean-all^|clean-exporter]
+if not "%BUILD_TYPE%"=="ReleaseMini" if not "%BUILD_TYPE%"=="ReleaseAll" if not "%BUILD_TYPE%"=="ReleaseExporter" if not "%BUILD_TYPE%"=="ReleaseMeshopt" if not "%BUILD_TYPE%"=="all" if not "%BUILD_TYPE%"=="clean" if not "%BUILD_TYPE%"=="clean-mini" if not "%BUILD_TYPE%"=="clean-all" if not "%BUILD_TYPE%"=="clean-exporter" if not "%BUILD_TYPE%"=="clean-meshopt" (
+    echo Error: Only ReleaseMini, ReleaseAll, ReleaseExporter, ReleaseMeshopt, all, clean, clean-mini, clean-all, clean-exporter, or clean-meshopt are supported
+    echo Usage: %0 [ReleaseMini^|ReleaseAll^|ReleaseExporter^|ReleaseMeshopt^|all^|clean^|clean-mini^|clean-all^|clean-exporter^|clean-meshopt]
     goto :error
 )
 
@@ -18,6 +18,7 @@ if "%BUILD_TYPE%"=="clean" (
     if exist build_wasm_mini rmdir /s /q build_wasm_mini
     if exist build_wasm_all rmdir /s /q build_wasm_all
     if exist build_wasm_exporter rmdir /s /q build_wasm_exporter
+    if exist build_wasm_meshopt rmdir /s /q build_wasm_meshopt
     echo All build caches cleaned!
     goto :end
 )
@@ -39,6 +40,12 @@ if "%BUILD_TYPE%"=="clean-exporter" (
     echo Exporter build cache cleaned!
     goto :end
 )
+if "%BUILD_TYPE%"=="clean-meshopt" (
+    echo Cleaning meshopt build cache...
+    if exist build_wasm_meshopt rmdir /s /q build_wasm_meshopt
+    echo Meshopt build cache cleaned!
+    goto :end
+)
 
 echo Building AssimpJS for %BUILD_TYPE%...
 
@@ -49,13 +56,15 @@ if "%BUILD_TYPE%"=="all" (
     call :build_target ReleaseMini build_wasm_mini || goto :error
     call :build_target ReleaseAll build_wasm_all || goto :error
     call :build_target ReleaseExporter build_wasm_exporter || goto :error
-    call :copy_artifacts build_wasm_mini\ReleaseMini\assimpjs-mini.* build_wasm_all\ReleaseAll\assimpjs-all.* build_wasm_exporter\ReleaseExporter\assimpjs-exporter.*
+    call :build_target ReleaseMeshopt build_wasm_meshopt || goto :error
+    call :copy_artifacts build_wasm_mini\ReleaseMini\assimpjs-mini.* build_wasm_all\ReleaseAll\assimpjs-all.* build_wasm_exporter\ReleaseExporter\assimpjs-exporter.* build_wasm_meshopt\ReleaseMeshopt\assimpjs-meshopt.*
 ) else (
     REM Map build type to build directory
     set BUILD_DIR=build_wasm
     if "%BUILD_TYPE%"=="ReleaseMini" set BUILD_DIR=build_wasm_mini
     if "%BUILD_TYPE%"=="ReleaseAll" set BUILD_DIR=build_wasm_all
     if "%BUILD_TYPE%"=="ReleaseExporter" set BUILD_DIR=build_wasm_exporter
+    if "%BUILD_TYPE%"=="ReleaseMeshopt" set BUILD_DIR=build_wasm_meshopt
     
     echo Building single AssimpJS target (%BUILD_TYPE%)...
     call :build_target %BUILD_TYPE% %BUILD_DIR% || goto :error

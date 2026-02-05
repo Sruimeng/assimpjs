@@ -3,7 +3,7 @@ cmake_minimum_required (VERSION 3.6)
 set_property (GLOBAL PROPERTY USE_FOLDERS ON)
 
 set (CMAKE_SUPPRESS_REGENERATION 1)
-set (CMAKE_CONFIGURATION_TYPES Debug;ReleaseMini;ReleaseAll;ReleaseExporter;RelWithDebInfo;MinSizeRel)
+set (CMAKE_CONFIGURATION_TYPES Debug;ReleaseMini;ReleaseAll;ReleaseExporter;ReleaseMeshopt;RelWithDebInfo;MinSizeRel)
 
 add_definitions (-DUNICODE -D_UNICODE)
 
@@ -55,7 +55,7 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseAll")
   set (ASSIMP_BUILD_X3D_IMPORTER ON CACHE BOOL "")
   set (ASSIMP_BUILD_VRML_IMPORTER ON CACHE BOOL "")
   set (ASSIMP_BUILD_IFC_IMPORTER ON CACHE BOOL "")
-  set (ASSIMP_BUILD_USD_IMPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_USD_IMPORTER ON CACHE BOOL "" FORCE)
 elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseExporter")
   # ReleaseExporter: MINIMAL IMPORTERS support (GLTF/GLB/ASSJSON only) but ALL EXPORTERS enabled
   
@@ -72,6 +72,27 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseExporter")
   set (ASSIMP_BUILD_M3D_EXPORTER OFF CACHE BOOL "")  # Disabled due memory leaks
   set (ASSIMP_BUILD_ASSBIN_EXPORTER OFF CACHE BOOL "")  # Not a true file format
   set (ASSIMP_BUILD_ASSXML_EXPORTER OFF CACHE BOOL "")  # Not a true file format
+elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseMeshopt")
+  # ReleaseMeshopt: GLB(meshopt) + FBX import, focused export set
+  set (ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "")
+  set (ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "")
+
+  # Importers
+  set (ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_FBX_IMPORTER ON CACHE BOOL "")
+
+  # Exporters
+  set (ASSIMP_BUILD_OBJ_EXPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_STL_EXPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_FBX_EXPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_GLTF_EXPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_3MF_EXPORTER ON CACHE BOOL "")
+
+  # Optional meshopt decoder
+  set (ASSIMP_BUILD_MESHOPT ON CACHE BOOL "")
+
+  # Enable tinyusdz for USD export path
+  set (ASSIMP_BUILD_USD_IMPORTER ON CACHE BOOL "" FORCE)
 endif()
 
 if (${EMSCRIPTEN})
@@ -99,6 +120,8 @@ file (GLOB
 )
 source_group ("Sources" FILES ${AssimpJSSourceFiles})
 
+option(ASSIMPJS_ENABLE_CLOSURE "Enable Closure Compiler for Emscripten output (requires Java)" OFF)
+
 if (${EMSCRIPTEN})
 	add_executable (AssimpJS ${AssimpJSSourceFiles})
 	target_compile_options (AssimpJS PUBLIC "$<$<CONFIG:Debug>:-gsource-map>")
@@ -116,7 +139,9 @@ if (${EMSCRIPTEN})
 	target_link_options (AssimpJS PUBLIC -sASSERTIONS=0)            # Disable assertions for production
 	
 	# Javascript size optimizations
-	target_link_options (AssimpJS PUBLIC --closure=1)               # Google Closure Compiler optimization
+	if (ASSIMPJS_ENABLE_CLOSURE)
+		target_link_options (AssimpJS PUBLIC --closure=1)               # Google Closure Compiler optimization
+	endif ()
 	
 	# Dynamic memory management for variable file sizes with increased stack for large IFC files
 	target_link_options (AssimpJS PUBLIC -sALLOW_MEMORY_GROWTH=1)   # Allow unlimited memory growth as needed
@@ -137,12 +162,18 @@ else ()
 endif ()
 
 target_link_libraries (AssimpJS assimp)
+if (ASSIMP_BUILD_USD_IMPORTER)
+  target_compile_definitions (AssimpJS PRIVATE ASSIMPJS_ENABLE_TINYUSDZ=1)
+  target_include_directories (AssimpJS PRIVATE ${CMAKE_BINARY_DIR}/_deps/tinyusdz_repo-src/src)
+endif ()
 if (CMAKE_BUILD_TYPE STREQUAL "ReleaseMini")
   set_target_properties(AssimpJS PROPERTIES OUTPUT_NAME assimpjs-mini)
 elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseAll")
   set_target_properties(AssimpJS PROPERTIES OUTPUT_NAME assimpjs-all)
 elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseExporter")
   set_target_properties(AssimpJS PROPERTIES OUTPUT_NAME assimpjs-exporter)
+elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseMeshopt")
+  set_target_properties(AssimpJS PROPERTIES OUTPUT_NAME assimpjs-meshopt)
 endif()
 set_target_properties (AssimpJS PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${CMAKE_BUILD_TYPE}")
 

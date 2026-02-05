@@ -3,13 +3,13 @@
 # Change to project root
 cd "$(dirname "$0")/.." || exit
 
-# Support ReleaseMini, ReleaseAll, ReleaseExporter, all, clean, or individual clean options
+# Support ReleaseMini, ReleaseAll, ReleaseExporter, ReleaseMeshopt, all, clean, or individual clean options
 BUILD_TYPE=${1:-ReleaseMini}
 
 # Validate build type
-if [[ "$BUILD_TYPE" != "ReleaseMini" && "$BUILD_TYPE" != "ReleaseAll" && "$BUILD_TYPE" != "ReleaseExporter" && "$BUILD_TYPE" != "all" && "$BUILD_TYPE" != "clean" && "$BUILD_TYPE" != "clean-mini" && "$BUILD_TYPE" != "clean-all" && "$BUILD_TYPE" != "clean-exporter" ]]; then
-    echo "Error: Only ReleaseMini, ReleaseAll, ReleaseExporter, all, clean, clean-mini, clean-all, or clean-exporter are supported"
-    echo "Usage: $0 [ReleaseMini|ReleaseAll|ReleaseExporter|all|clean|clean-mini|clean-all|clean-exporter]"
+if [[ "$BUILD_TYPE" != "ReleaseMini" && "$BUILD_TYPE" != "ReleaseAll" && "$BUILD_TYPE" != "ReleaseExporter" && "$BUILD_TYPE" != "ReleaseMeshopt" && "$BUILD_TYPE" != "all" && "$BUILD_TYPE" != "clean" && "$BUILD_TYPE" != "clean-mini" && "$BUILD_TYPE" != "clean-all" && "$BUILD_TYPE" != "clean-exporter" && "$BUILD_TYPE" != "clean-meshopt" ]]; then
+    echo "Error: Only ReleaseMini, ReleaseAll, ReleaseExporter, ReleaseMeshopt, all, clean, clean-mini, clean-all, clean-exporter, or clean-meshopt are supported"
+    echo "Usage: $0 [ReleaseMini|ReleaseAll|ReleaseExporter|ReleaseMeshopt|all|clean|clean-mini|clean-all|clean-exporter|clean-meshopt]"
     exit 1
 fi
 
@@ -17,6 +17,7 @@ fi
 if [[ "$BUILD_TYPE" == "clean" ]]; then
     echo "Cleaning all build caches..."
     rm -rf build_wasm_mini build_wasm_all build_wasm_exporter
+    rm -rf build_wasm_meshopt
     echo "All build caches cleaned!"
     exit 0
 elif [[ "$BUILD_TYPE" == "clean-mini" ]]; then
@@ -33,6 +34,11 @@ elif [[ "$BUILD_TYPE" == "clean-exporter" ]]; then
     echo "Cleaning exporter build cache..."
     rm -rf build_wasm_exporter
     echo "Exporter build cache cleaned!"
+    exit 0
+elif [[ "$BUILD_TYPE" == "clean-meshopt" ]]; then
+    echo "Cleaning meshopt build cache..."
+    rm -rf build_wasm_meshopt
+    echo "Meshopt build cache cleaned!"
     exit 0
 fi
 
@@ -62,6 +68,11 @@ if [[ "$BUILD_TYPE" == "all" ]]; then
     emcmake cmake -B build_wasm_exporter -G "Unix Makefiles" -DEMSCRIPTEN=1 -DCMAKE_BUILD_TYPE=ReleaseExporter . || exit 1
     emmake make -C build_wasm_exporter -j"$NPROC" AssimpJS || exit 1
 
+    # Build meshopt version
+    echo "Building meshopt version..."
+    emcmake cmake -B build_wasm_meshopt -G "Unix Makefiles" -DEMSCRIPTEN=1 -DCMAKE_BUILD_TYPE=ReleaseMeshopt . || exit 1
+    emmake make -C build_wasm_meshopt -j"$NPROC" AssimpJS || exit 1
+
     echo "Running tests..."
     npm run test || exit 1
 
@@ -71,6 +82,7 @@ if [[ "$BUILD_TYPE" == "all" ]]; then
     cp build_wasm_mini/ReleaseMini/assimpjs-mini.* dist/ 2>/dev/null || true
     cp build_wasm_all/ReleaseAll/assimpjs-all.* dist/ 2>/dev/null || true
     cp build_wasm_exporter/ReleaseExporter/assimpjs-exporter.* dist/ 2>/dev/null || true
+    cp build_wasm_meshopt/ReleaseMeshopt/assimpjs-meshopt.* dist/ 2>/dev/null || true
 else
     # Map build type to build directory
     case "$BUILD_TYPE" in
@@ -82,6 +94,9 @@ else
             ;;
         "ReleaseExporter")
             BUILD_DIR="build_wasm_exporter"
+            ;;
+        "ReleaseMeshopt")
+            BUILD_DIR="build_wasm_meshopt"
             ;;
     esac
     

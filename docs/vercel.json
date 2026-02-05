@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/meshopt",
+      "destination": "/meshopt.html"
+    },
+    {
+      "source": "/meshopt/",
+      "destination": "/meshopt.html"
+    }
+  ]
+}

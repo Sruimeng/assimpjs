@@ -31,9 +31,17 @@ if (fs.existsSync(exporterBuildPath)) {
     assimpjsExporter = require(exporterBuildPath)();
 }
 
+// Try to load meshopt build (from separate build directory)
+let assimpjsMeshopt;
+const meshoptBuildPath = path.join(__dirname, '../build_wasm_meshopt/' + config + 'Meshopt/assimpjs-meshopt.js');
+if (fs.existsSync(meshoptBuildPath)) {
+    assimpjsMeshopt = require(meshoptBuildPath)();
+}
+
 let ajsMini = null;
 let ajsAll = null;
 let ajsExporter = null;
+let ajsMeshopt = null;
 
 before (async function () {
 	console.log('Loading AssimpJS build variants...');
@@ -52,6 +60,11 @@ before (async function () {
 		ajsExporter = await assimpjsExporter;
 		console.log('✓ Exporter build loaded');
 	}
+
+	if (assimpjsMeshopt && ajsMeshopt === null) {
+		ajsMeshopt = await assimpjsMeshopt;
+		console.log('✓ Meshopt build loaded');
+	}
 	
 	if (!ajsMini) {
 		throw new Error('No mini build found. Expected build at build_wasm_mini/' + config + 'Mini/');
@@ -61,6 +74,16 @@ before (async function () {
 function GetTestFileLocation (fileName)
 {
 	return path.join (__dirname, '../assimp/test/models/' + fileName);
+}
+
+function GetFixtureFileLocation (fileName)
+{
+	return path.join (__dirname, 'fixtures/' + fileName);
+}
+
+function HasTestFiles (files)
+{
+	return files.every ((fileName) => fs.existsSync (GetTestFileLocation (fileName)));
 }
 
 function LoadModel (files, assimpInstance = ajsMini)
@@ -470,6 +493,18 @@ it ('HMP', function () {
 });
 
 it ('IFC', function () {
+	const ifcFiles = [
+		'IFC/AC14-FZK-Haus-IFC2X3.ifc',
+		'IFC/cube-blender-IFC4.ifc',
+		'IFC/cube-freecad-IFC4.ifc',
+		'IFC/Building-Architecture-IFC4X3_ADD2.ifc',
+		'IFC/dental_clinic.ifc',
+		'IFC/C20-Institute-Var-2.ifc'
+	];
+	if (!HasTestFiles (ifcFiles)) {
+		this.skip ();
+	}
+
 	if (!ajsAll) {
 		// If all build isn't available, these should error (same as mini build)
 		assert (IsError (['IFC/AC14-FZK-Haus-IFC2X3.ifc']));
@@ -777,11 +812,11 @@ it ('USD', function () {
 
 describe ('Exporter', function () {
 it ('OBJ Export', function () {
-	assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], 'obj', ['result.obj', 'result.mtl']));
-	assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], 'obj', ['result.obj', 'result.mtl']));
-	assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], 'obj', ['result.obj', 'result.mtl']));
-	assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], 'obj', ['result.obj', 'result.mtl']));
-	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'obj', ['result.obj', 'result.mtl']));
+	assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], 'obj', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], 'obj', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], 'obj', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], 'obj', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'obj', ['result.zip']));
 });
 
 it ('PLY Export', function () {
@@ -802,11 +837,11 @@ it ('STL Export', function () {
 });
 
 it ('FBX Export', function () {
-	assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], 'fbx', ['result.fbx']));
-	assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], 'fbx', ['result.fbx']));
-	assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], 'fbx', ['result.fbx']));
-	assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], 'fbx', ['result.fbx']));
-	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'fbx', ['result.fbx']));
+	assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], 'fbx', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], 'fbx', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], 'fbx', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], 'fbx', ['result.zip']));
+	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'fbx', ['result.zip']));
 });
 
 it ('DAE Export', function () {
@@ -834,12 +869,11 @@ it ('X3D Export', function () {
 });
 
 it ('3MF Export', function () {
-  // 3MF appears to be broken in the exporter, no files are generated.
-  assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], '3mf', []));
-  assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], '3mf', []));
-  assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], '3mf', []));
-  assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], '3mf', []));
-  assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], '3mf', []));
+  assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], '3mf', ['result.3mf']));
+  assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], '3mf', ['result.3mf']));
+  assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], '3mf', ['result.3mf']));
+  assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], '3mf', ['result.3mf']));
+  assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], '3mf', ['result.3mf']));
 });
 
 it ('3DS Export', function () {
@@ -856,5 +890,35 @@ it ('STEP Export', function () {
 	assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], 'stp', ['result.stp']));
 	assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], 'stp', ['result.stp']));
 	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'stp', ['result.stp']));
+});
+});
+
+describe ('Meshopt Build', function () {
+it ('Meshopt GLB Import', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const meshoptPath = GetFixtureFileLocation ('BoxTextured-meshopt-nofallback.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (meshoptPath, fs.readFileSync (meshoptPath));
+	let result = ajsMeshopt.ConvertFileList (fileList, 'obj');
+	assert (result.IsSuccess ());
+	assert (result.FileCount () > 0);
+});
+
+it ('USD Export (TinyUSDZ)', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let result = ajsMeshopt.ConvertFileList (fileList, 'usd');
+	assert (result.IsSuccess ());
+	assert (result.FileCount () > 0);
+	let usdFile = result.GetFile (0);
+	let content = Buffer.from (usdFile.GetContent ());
+	let header = content.toString ('utf8', 0, 16);
+	assert (header.includes ('PXR-USDC') || header.includes ('#usda 1.0'));
 });
 });
