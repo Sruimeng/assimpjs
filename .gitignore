@@ -40,8 +40,11 @@
 # debug information files
 *.dwo
 .cache
+.DS_Store
 # Ignore local emsdk checkout
 tools/emsdk/
+/emsdk/
+/assimp/
 node_modules/
 build
 temp
@@ -49,3 +52,4 @@ build_wasm_all
 build_wasm_exporter
 build_wasm_meshopt
 build_wasm_mini
+/test/fixtures/tripo_input_*.glb
