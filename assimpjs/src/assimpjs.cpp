@@ -39,7 +39,12 @@ static unsigned int GetImportFlagsForFormat (const std::string& format)
 		aiProcess_Triangulate |
 		aiProcess_GenUVCoords |
 		aiProcess_JoinIdenticalVertices |
+		aiProcess_LimitBoneWeights |
 		aiProcess_SortByPType;
+
+	if (format == "glb" || format == "glb2") {
+		flags &= ~aiProcess_JoinIdenticalVertices;
+	}
 
 	if (format == "fbx" || format == "obj") {
 		flags |= aiProcess_EmbedTextures;
@@ -650,12 +655,26 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 		return false;
 	}
 	std::string warn;
+	std::string usdaStr;
+	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
+		if (format == "usd" || format == "usda") {
+			return ExportSceneUsdFallback (scene, format, result);
+		}
+		result.errorCode = ErrorCode::ExportError;
+		return false;
+	}
+
 	if (format == "usd" || format == "usdc") {
-		std::string usdaStr;
-		if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
+#if defined(EMSCRIPTEN)
+		if (format == "usdc") {
 			result.errorCode = ErrorCode::ExportError;
 			return false;
 		}
+		Buffer content (usdaStr.begin (), usdaStr.end ());
+		result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
+		result.errorCode = ErrorCode::NoError;
+		return true;
+#else
 		tinyusdz::Stage stage;
 		tinyusdz::USDLoadOptions loadOptions;
 		loadOptions.load_assets = false;
@@ -692,13 +711,9 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 		result.fileList.AddFile (GetFileNameFromFormat (format), content);
 		result.errorCode = ErrorCode::NoError;
 		return true;
+#endif
 	}
 
-	std::string usdaStr;
-	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
-		result.errorCode = ErrorCode::ExportError;
-		return false;
-	}
 	Buffer content (usdaStr.begin (), usdaStr.end ());
 	result.fileList.AddFile (GetFileNameFromFormat (format), content);
 	result.errorCode = ErrorCode::NoError;
