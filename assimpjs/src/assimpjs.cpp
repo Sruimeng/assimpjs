@@ -657,7 +657,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	std::string warn;
 	std::string usdaStr;
 	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
-		if (format == "usd" || format == "usda") {
+		if (format == "usda") {
 			return ExportSceneUsdFallback (scene, format, result);
 		}
 		result.errorCode = ErrorCode::ExportError;
@@ -665,16 +665,6 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	}
 
 	if (format == "usd" || format == "usdc") {
-#if defined(EMSCRIPTEN)
-		if (format == "usdc") {
-			result.errorCode = ErrorCode::ExportError;
-			return false;
-		}
-		Buffer content (usdaStr.begin (), usdaStr.end ());
-		result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
-		result.errorCode = ErrorCode::NoError;
-		return true;
-#else
 		tinyusdz::Stage stage;
 		tinyusdz::USDLoadOptions loadOptions;
 		loadOptions.load_assets = false;
@@ -711,7 +701,6 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 		result.fileList.AddFile (GetFileNameFromFormat (format), content);
 		result.errorCode = ErrorCode::NoError;
 		return true;
-#endif
 	}
 
 	Buffer content (usdaStr.begin (), usdaStr.end ());

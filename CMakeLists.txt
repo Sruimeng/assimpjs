@@ -14,6 +14,7 @@ project (AssimpJS)
 set (BUILD_SHARED_LIBS OFF CACHE BOOL "")
 set (ASSIMP_BUILD_TESTS OFF CACHE BOOL "")
 set (ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "")
+set (ASSIMP_BUILD_TINYUSDZ OFF CACHE BOOL "")
 
 if (CMAKE_BUILD_TYPE STREQUAL "ReleaseMini" OR CMAKE_BUILD_TYPE STREQUAL "ReleaseAll")
   # Enable all IMPORTERS by default, DISABLE all EXPORTERS by default
@@ -91,8 +92,9 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseMeshopt")
   # Optional meshopt decoder
   set (ASSIMP_BUILD_MESHOPT ON CACHE BOOL "")
 
-  # Enable tinyusdz for USD export path
-  set (ASSIMP_BUILD_USD_IMPORTER ON CACHE BOOL "" FORCE)
+  # Enable tinyusdz core for USD export path (without assimp USD importer)
+  set (ASSIMP_BUILD_USD_IMPORTER OFF CACHE BOOL "" FORCE)
+  set (ASSIMP_BUILD_TINYUSDZ ON CACHE BOOL "" FORCE)
 endif()
 
 if (${EMSCRIPTEN})
@@ -162,9 +164,10 @@ else ()
 endif ()
 
 target_link_libraries (AssimpJS assimp)
-if (ASSIMP_BUILD_USD_IMPORTER)
+if (ASSIMP_BUILD_USD_IMPORTER OR ASSIMP_BUILD_TINYUSDZ)
   target_compile_definitions (AssimpJS PRIVATE ASSIMPJS_ENABLE_TINYUSDZ=1)
   target_include_directories (AssimpJS PRIVATE ${CMAKE_BINARY_DIR}/_deps/tinyusdz_repo-src/src)
+  target_include_directories (AssimpJS PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/assimp/contrib/tinyusdz/autoclone/tinyusdz_repo-src/src)
 endif ()
 if (CMAKE_BUILD_TYPE STREQUAL "ReleaseMini")
   set_target_properties(AssimpJS PROPERTIES OUTPUT_NAME assimpjs-mini)

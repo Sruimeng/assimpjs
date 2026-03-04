@@ -924,6 +924,6 @@ it ('USD Export (TinyUSDZ)', function () {
 	let usdFile = result.GetFile (0);
 	let content = Buffer.from (usdFile.GetContent ());
 	let header = content.toString ('utf8', 0, 16);
-	assert (header.includes ('PXR-USDC') || header.includes ('#usda 1.0'));
+	assert (header.includes ('PXR-USDC'));
 });
 });
