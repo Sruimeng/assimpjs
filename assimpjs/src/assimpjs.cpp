@@ -1481,11 +1481,27 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 
 	if (format == "3mf") {
 		// 3MF 需要 X 轴旋转 90 度 + 缩小 100 倍
+		// 3MF导出器不使用节点变换，需要直接变换mesh顶点
 		aiMatrix4x4 rotX;
 		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
 		aiMatrix4x4 scale;
 		aiMatrix4x4::Scaling (aiVector3D (0.01f, 0.01f, 0.01f), scale);
-		mutableScene->mRootNode->mTransformation = scale * rotX * mutableScene->mRootNode->mTransformation;
+		aiMatrix4x4 transform = scale * rotX;
+
+		// 应用变换到所有mesh的顶点
+		for (unsigned int i = 0; i < mutableScene->mNumMeshes; ++i) {
+			aiMesh* mesh = mutableScene->mMeshes[i];
+			if (mesh != nullptr) {
+				for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+					mesh->mVertices[v] = transform * mesh->mVertices[v];
+					// 法线也需要变换（使用逆转置矩阵，但对于旋转+均匀缩放，直接用原矩阵即可）
+					if (mesh->mNormals != nullptr) {
+						mesh->mNormals[v] = transform * mesh->mNormals[v];
+						mesh->mNormals[v].Normalize();
+					}
+				}
+			}
+		}
 	}
 
 	aiReturn exportResult = aiReturn_FAILURE;
