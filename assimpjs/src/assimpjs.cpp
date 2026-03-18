@@ -1191,9 +1191,9 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		rmesh.points.resize (inst.mesh->mNumVertices);
 		for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
 			aiVector3D p = inst.transform * inst.mesh->mVertices[v];
-			rmesh.points[v][0] = p.x;
-			rmesh.points[v][1] = p.y;
-			rmesh.points[v][2] = p.z;
+			rmesh.points[v][0] = p.x * 100.0f;
+			rmesh.points[v][1] = p.y * 100.0f;
+			rmesh.points[v][2] = p.z * 100.0f;
 		}
 
 		rmesh.usdFaceVertexCounts.reserve (inst.mesh->mNumFaces);
