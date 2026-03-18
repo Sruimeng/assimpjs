@@ -166,14 +166,17 @@ static void ApplyMaterialFactors (aiScene* scene, float metallic, float roughnes
 	if (scene == nullptr) {
 		return;
 	}
-	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
-		aiMaterial* mat = scene->mMaterials[i];
-		if (mat == nullptr) {
-			continue;
-		}
-		mat->AddProperty (&metallic, 1, AI_MATKEY_METALLIC_FACTOR);
-		mat->AddProperty (&roughness, 1, AI_MATKEY_ROUGHNESS_FACTOR);
+	// 仅在场景只有一个材质时应用 metadata 中的 metallic/roughness
+	// 多材质场景中，每个材质应保留自己的值
+	if (scene->mNumMaterials != 1) {
+		return;
 	}
+	aiMaterial* mat = scene->mMaterials[0];
+	if (mat == nullptr) {
+		return;
+	}
+	mat->AddProperty (&metallic, 1, AI_MATKEY_METALLIC_FACTOR);
+	mat->AddProperty (&roughness, 1, AI_MATKEY_ROUGHNESS_FACTOR);
 }
 
 static const aiScene* ImportFileListByMainFile (Assimp::Importer& importer, const File& file, unsigned int flags)
@@ -187,9 +190,9 @@ static const aiScene* ImportFileListByMainFile (Assimp::Importer& importer, cons
 	return nullptr;
 }
 
-static std::string GetFileNameFromFormat (const std::string& format)
+static std::string GetFileNameFromFormat (const std::string& format, const std::string& projectName)
 {
-	std::string fileName = "result";
+	std::string fileName = projectName.empty() ? "result" : projectName;
 	if (format == "assjson") {
 		fileName += ".json";
 	} else if (format == "gltf" || format == "gltf2") {
@@ -785,7 +788,7 @@ static void WriteUsdNode (std::ostringstream& ss, const aiScene* scene, const ai
 	ss << "}\n";
 }
 
-static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result)
+static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -827,7 +830,7 @@ static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& for
 
 	std::string contentStr = ss.str ();
 	Buffer content (contentStr.begin (), contentStr.end ());
-	result.fileList.AddFile (GetFileNameFromFormat (format), content);
+	result.fileList.AddFile (GetFileNameFromFormat (format, projectName), content);
 	result.errorCode = ErrorCode::NoError;
 	return true;
 }
@@ -953,7 +956,8 @@ static int32_t AddTexture (
 	aiTextureType                            texType,
 	const std::string&                       paramName,
 	std::unordered_map<std::string, int32_t>& cache,
-	tinyusdz::tydra::RenderScene&            rs)
+	tinyusdz::tydra::RenderScene&            rs,
+	const std::string&                       projectName)
 {
 	aiString texPath;
 	if (mat->GetTexture (texType, 0, &texPath) != AI_SUCCESS) {
@@ -992,8 +996,8 @@ static int32_t AddTexture (
 
 	// TextureImage — asset_identifier is the filename inside the USDZ.
 	tinyusdz::tydra::TextureImage img;
-	img.asset_identifier = "textures/" + paramName + "_" +
-		std::to_string (buf_id) + "." + ext;
+	std::string baseName = projectName.empty() ? "result" : projectName;
+	img.asset_identifier = "textures/" + baseName + "_" + paramName + "." + ext;
 	img.buffer_id = buf_id;
 	img.decoded   = false;
 
@@ -1038,7 +1042,7 @@ static void CollectMeshInstances (const aiScene* scene, const aiNode* node, cons
 	}
 }
 
-static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err)
+static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err, const std::string& projectName)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		err = "scene is null";
@@ -1100,11 +1104,11 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		// Base colour texture
 		{
 			int32_t tid = AddTexture (scene, aimat, aiTextureType_BASE_COLOR,
-				"baseColor", texCache, out);
+				"baseColor", texCache, out, projectName);
 			if (tid < 0) {
 				// fall back to legacy diffuse slot
 				tid = AddTexture (scene, aimat, aiTextureType_DIFFUSE,
-					"baseColor", texCache, out);
+					"baseColor", texCache, out, projectName);
 			}
 			if (tid >= 0) {
 				pss.diffuseColor.texture_id = tid;
@@ -1119,11 +1123,29 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 			}
 		}
 
+		// Metallic texture
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_METALNESS,
+				"metallic", texCache, out, projectName);
+			if (tid >= 0) {
+				pss.metallic.texture_id = tid;
+			}
+		}
+
 		// Roughness factor
 		{
 			float val = 0.5f;
 			if (aimat->Get (AI_MATKEY_ROUGHNESS_FACTOR, val) == AI_SUCCESS) {
 				pss.roughness.value = val;
+			}
+		}
+
+		// Roughness texture
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_DIFFUSE_ROUGHNESS,
+				"roughness", texCache, out, projectName);
+			if (tid >= 0) {
+				pss.roughness.texture_id = tid;
 			}
 		}
 
@@ -1140,7 +1162,7 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		// Emissive texture
 		{
 			int32_t tid = AddTexture (scene, aimat, aiTextureType_EMISSIVE,
-				"emissive", texCache, out);
+				"emissive", texCache, out, projectName);
 			if (tid >= 0) {
 				pss.emissiveColor.texture_id = tid;
 			}
@@ -1149,7 +1171,7 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		// Normal map
 		{
 			int32_t tid = AddTexture (scene, aimat, aiTextureType_NORMALS,
-				"normal", texCache, out);
+				"normal", texCache, out, projectName);
 			if (tid >= 0) {
 				pss.normal.texture_id = tid;
 			}
@@ -1258,12 +1280,12 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 
 #endif
 
-static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result)
+static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
 {
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
 	tinyusdz::tydra::RenderScene renderScene;
 	std::string err;
-	if (!BuildTinyUsdScene (scene, renderScene, err)) {
+	if (!BuildTinyUsdScene (scene, renderScene, err, projectName)) {
 		result.errorCode = ErrorCode::ExportError;
 		return false;
 	}
@@ -1271,7 +1293,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	std::string usdaStr;
 	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
 		if (format == "usda") {
-			return ExportSceneUsdFallback (scene, format, result);
+			return ExportSceneUsdFallback (scene, format, result, projectName);
 		}
 		result.errorCode = ErrorCode::ExportError;
 		return false;
@@ -1283,7 +1305,8 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 		if (!renderScene.images.empty ()) {
 			std::vector<USDZEntry> entries;
 			std::vector<uint8_t> usdaBytes (usdaStr.begin (), usdaStr.end ());
-			entries.push_back ({"model.usda", usdaBytes});
+			std::string baseName = projectName.empty() ? "model" : projectName;
+			entries.push_back ({baseName + ".usda", usdaBytes});
 			for (size_t i = 0; i < renderScene.images.size (); ++i) {
 				const auto& img = renderScene.images[i];
 				if (img.buffer_id < 0 ||
@@ -1296,13 +1319,13 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 			std::vector<uint8_t> usdz;
 			if (CreateUSDZ (entries, usdz)) {
 				Buffer content (usdz.begin (), usdz.end ());
-				result.fileList.AddFile ("model.usdz", content);
+				result.fileList.AddFile (baseName + ".usdz", content);
 				result.errorCode = ErrorCode::NoError;
 				return true;
 			}
 			// CreateUSDZ failed — fall through to plain USDA output.
 			Buffer content (usdaStr.begin (), usdaStr.end ());
-			result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
+			result.fileList.AddFile (GetFileNameFromFormat ("usd", projectName), content);
 			result.errorCode = ErrorCode::NoError;
 			return true;
 		}
@@ -1325,7 +1348,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 				return false;
 			}
 			Buffer content (usdaStr.begin (), usdaStr.end ());
-			result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
+			result.fileList.AddFile (GetFileNameFromFormat ("usd", projectName), content);
 			result.errorCode = ErrorCode::NoError;
 			return true;
 		}
@@ -1336,23 +1359,23 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 				return false;
 			}
 			Buffer content (usdaStr.begin (), usdaStr.end ());
-			result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
+			result.fileList.AddFile (GetFileNameFromFormat ("usd", projectName), content);
 			result.errorCode = ErrorCode::NoError;
 			return true;
 		}
 
 		Buffer content (usdc.begin (), usdc.end ());
-		result.fileList.AddFile (GetFileNameFromFormat (format), content);
+		result.fileList.AddFile (GetFileNameFromFormat (format, projectName), content);
 		result.errorCode = ErrorCode::NoError;
 		return true;
 	}
 
 	Buffer content (usdaStr.begin (), usdaStr.end ());
-	result.fileList.AddFile (GetFileNameFromFormat (format), content);
+	result.fileList.AddFile (GetFileNameFromFormat (format, projectName), content);
 	result.errorCode = ErrorCode::NoError;
 	return true;
 #else
-	return ExportSceneUsdFallback (scene, format, result);
+	return ExportSceneUsdFallback (scene, format, result, projectName);
 #endif
 }
 
@@ -1395,7 +1418,7 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	}
 
 	if (format == "usd" || format == "usda" || format == "usdc") {
-		return ExportSceneUsd (scene, format, result);
+		return ExportSceneUsd (scene, format, result, projectName);
 	}
 
 	const bool isGltfOutput =
@@ -1415,7 +1438,7 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 
 	Assimp::ExportProperties exportProperties;
 	exportProperties.SetPropertyBool ("JSON_SKIP_WHITESPACES", true);
-	std::string fileName = GetFileNameFromFormat (format);
+	std::string fileName = GetFileNameFromFormat (format, projectName);
 	
 	// Map dae format to collada for Assimp's internal format identifier
 	std::string assimpFormat = format;
@@ -1441,7 +1464,8 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		UpdateEmbeddedTextureFilenames (mutableScene, naming);
 	}
 
-	if (format == "fbx" || format == "obj") {
+	// 对所有非 GLB 格式同步节点名到 mesh（GLB 本身保留节点名，不需要同步）
+	if (format != "glb" && format != "glb2" && format != "gltf" && format != "gltf2") {
 		// 从子节点开始遍历，跳过根节点（根节点名通常为 "result"/"Scene" 等无意义值）
 		for (unsigned int i = 0; i < scene->mRootNode->mNumChildren; ++i) {
 			SyncMeshNamesFromNodes (scene->mRootNode->mChildren[i], mutableScene);
@@ -1455,9 +1479,18 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		mutableScene->mRootNode->mTransformation = rotX * mutableScene->mRootNode->mTransformation;
 	}
 
+	if (format == "3mf") {
+		// 3MF 需要 X 轴旋转 90 度 + 缩小 100 倍
+		aiMatrix4x4 rotX;
+		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
+		aiMatrix4x4 scale;
+		aiMatrix4x4::Scaling (aiVector3D (0.01f, 0.01f, 0.01f), scale);
+		mutableScene->mRootNode->mTransformation = scale * rotX * mutableScene->mRootNode->mTransformation;
+	}
+
 	aiReturn exportResult = aiReturn_FAILURE;
 	try {
-		exportResult = exporter.Export (scene, assimpFormat.c_str (), fileName.c_str (), 0u, &exportProperties);
+		exportResult = exporter.Export (mutableScene, assimpFormat.c_str (), fileName.c_str (), 0u, &exportProperties);
 	} catch (const std::exception&) {
 		exportResult = aiReturn_FAILURE;
 	} catch (...) {
@@ -1492,6 +1525,72 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 
 	result.errorCode = ErrorCode::NoError;
 	return true;
+}
+
+static void RemoveUnusedMaterials (aiScene* scene)
+{
+	if (scene == nullptr || scene->mNumMaterials == 0) {
+		return;
+	}
+
+	// 标记使用的材质
+	std::vector<bool> usedMaterials (scene->mNumMaterials, false);
+	for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+		if (scene->mMeshes[i] != nullptr) {
+			unsigned int matIdx = scene->mMeshes[i]->mMaterialIndex;
+			if (matIdx < scene->mNumMaterials) {
+				usedMaterials[matIdx] = true;
+			}
+		}
+	}
+
+	// 计算未使用的材质数量
+	unsigned int numUnused = 0;
+	for (bool used : usedMaterials) {
+		if (!used) {
+			++numUnused;
+		}
+	}
+
+	if (numUnused == 0) {
+		return; // 所有材质都在使用
+	}
+
+	// 创建旧索引到新索引的映射
+	std::vector<unsigned int> oldToNew (scene->mNumMaterials);
+	unsigned int newIdx = 0;
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		if (usedMaterials[i]) {
+			oldToNew[i] = newIdx++;
+		}
+	}
+
+	// 创建新的材质数组
+	unsigned int newNumMaterials = scene->mNumMaterials - numUnused;
+	aiMaterial** newMaterials = new aiMaterial*[newNumMaterials];
+	newIdx = 0;
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		if (usedMaterials[i]) {
+			newMaterials[newIdx++] = scene->mMaterials[i];
+		} else {
+			delete scene->mMaterials[i];
+		}
+	}
+
+	// 更新场景
+	delete[] scene->mMaterials;
+	scene->mMaterials = newMaterials;
+	scene->mNumMaterials = newNumMaterials;
+
+	// 更新 mesh 的材质索引
+	for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+		if (scene->mMeshes[i] != nullptr) {
+			unsigned int oldIdx = scene->mMeshes[i]->mMaterialIndex;
+			if (oldIdx < oldToNew.size () && usedMaterials[oldIdx]) {
+				scene->mMeshes[i]->mMaterialIndex = oldToNew[oldIdx];
+			}
+		}
+	}
 }
 
 static bool ApplyMetadata (aiScene* scene, const MetadataOptions* meta)
@@ -1542,6 +1641,7 @@ Result ConvertFile (const File& file, const std::string& format, const FileLoade
 
 	Result result;
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
 	ExportScene (mutableScene, format, result, projectName);
 	return result;
@@ -1568,6 +1668,7 @@ Result ConvertFileList (const FileList& fileList, const std::string& format, con
 
 	Result result;
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
 	ExportScene (mutableScene, format, result, projectName);
 	return result;
