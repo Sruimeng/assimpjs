@@ -1480,12 +1480,13 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	}
 
 	if (format == "3mf") {
-		// 3MF 需要 X 轴旋转 90 度 + 缩小 100 倍
-		// 3MF导出器不使用节点变换，需要直接变换mesh顶点
+		// 3MF 需要 X 轴旋转 90 度 + 单位转换
+		// 3MF导出器使用millimeter单位，GLB是meter单位
+		// 缩小100倍 (0.01) × 转换为毫米 (1000) = 10
 		aiMatrix4x4 rotX;
 		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
 		aiMatrix4x4 scale;
-		aiMatrix4x4::Scaling (aiVector3D (0.01f, 0.01f, 0.01f), scale);
+		aiMatrix4x4::Scaling (aiVector3D (10.0f, 10.0f, 10.0f), scale);
 		aiMatrix4x4 transform = scale * rotX;
 
 		// 应用变换到所有mesh的顶点
