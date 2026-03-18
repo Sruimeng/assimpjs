@@ -52,6 +52,112 @@ static unsigned int GetImportFlagsForFormat (const std::string& format)
 	return flags;
 }
 
+static bool TryCreateMatrix4 (const std::vector<float>& matrix16, aiMatrix4x4& matrix)
+{
+	if (matrix16.size () != 16) {
+		return false;
+	}
+	// Input is column-major (GLTF/JS convention); aiMatrix4x4 is row-major — transpose.
+	matrix = aiMatrix4x4 (
+		matrix16[0], matrix16[4], matrix16[8],  matrix16[12],
+		matrix16[1], matrix16[5], matrix16[9],  matrix16[13],
+		matrix16[2], matrix16[6], matrix16[10], matrix16[14],
+		matrix16[3], matrix16[7], matrix16[11], matrix16[15]
+	);
+	return true;
+}
+
+static bool ApplyTransformToRootNode (const aiScene* scene, const aiMatrix4x4& transform)
+{
+	if (scene == nullptr || scene->mRootNode == nullptr) {
+		return false;
+	}
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	mutableScene->mRootNode->mTransformation = transform * mutableScene->mRootNode->mTransformation;
+	return true;
+}
+
+static bool ApplyTransformsToNodesByName (const aiNode* node, const NodeTransformMap& transformByName)
+{
+	if (node == nullptr) {
+		return false;
+	}
+	bool applied = false;
+	aiNode* mutableNode = const_cast<aiNode*> (node);
+	auto it = transformByName.find (mutableNode->mName.C_Str ());
+	if (it != transformByName.end ()) {
+		mutableNode->mTransformation = it->second;
+		applied = true;
+	}
+	for (unsigned int childIndex = 0; childIndex < mutableNode->mNumChildren; ++childIndex) {
+		if (ApplyTransformsToNodesByName (mutableNode->mChildren[childIndex], transformByName)) {
+			applied = true;
+		}
+	}
+	return applied;
+}
+
+static void RenameNodes (aiNode* node, const std::unordered_map<std::string, std::string>& renameMap, std::unordered_set<std::string>& used)
+{
+	if (node == nullptr) {
+		return;
+	}
+	std::string oldName = node->mName.C_Str ();
+	auto it = renameMap.find (oldName);
+	if (it != renameMap.end ()) {
+		std::string desired = it->second;
+		std::string finalName = desired;
+		int suffix = 1;
+		while (used.find (finalName) != used.end ()) {
+			finalName = desired + "_" + std::to_string (suffix++);
+		}
+		node->mName = aiString (finalName);
+	}
+	used.insert (node->mName.C_Str ());
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		RenameNodes (node->mChildren[i], renameMap, used);
+	}
+}
+
+static bool DeleteNodesByName (aiNode* node, const std::unordered_set<std::string>& toDelete)
+{
+	if (node == nullptr) {
+		return false;
+	}
+	bool removed = false;
+	unsigned int write = 0;
+	for (unsigned int read = 0; read < node->mNumChildren; ++read) {
+		aiNode* child = node->mChildren[read];
+		if (child != nullptr && toDelete.find (child->mName.C_Str ()) != toDelete.end ()) {
+			removed = true;
+			continue;
+		}
+		node->mChildren[write++] = child;
+	}
+	node->mNumChildren = write;
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		if (DeleteNodesByName (node->mChildren[i], toDelete)) {
+			removed = true;
+		}
+	}
+	return removed;
+}
+
+static void ApplyMaterialFactors (aiScene* scene, float metallic, float roughness)
+{
+	if (scene == nullptr) {
+		return;
+	}
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		aiMaterial* mat = scene->mMaterials[i];
+		if (mat == nullptr) {
+			continue;
+		}
+		mat->AddProperty (&metallic, 1, AI_MATKEY_METALLIC_FACTOR);
+		mat->AddProperty (&roughness, 1, AI_MATKEY_ROUGHNESS_FACTOR);
+	}
+}
+
 static const aiScene* ImportFileListByMainFile (Assimp::Importer& importer, const File& file, unsigned int flags)
 {
 	try {
@@ -120,7 +226,32 @@ struct EmbeddedTextureFile
 	Buffer content;
 };
 
-static std::vector<EmbeddedTextureFile> ExtractEmbeddedTextures (aiScene* scene, const std::string& folderPrefix)
+static bool TryCreateMatrix4 (const std::vector<float>& matrix16, aiMatrix4x4& matrix);
+
+static aiMatrix4x4 ToMatrix (const std::vector<float>& matrix16)
+{
+	aiMatrix4x4 m;
+	TryCreateMatrix4 (matrix16, m);
+	return m;
+}
+
+static bool NodeHasMeshes (const aiNode* node)
+{
+	if (node == nullptr) {
+		return false;
+	}
+	if (node->mNumMeshes > 0) {
+		return true;
+	}
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		if (NodeHasMeshes (node->mChildren[i])) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static std::vector<EmbeddedTextureFile> ExtractEmbeddedTextures (aiScene* scene, const std::string& folderPrefix, std::unordered_map<const aiTexture*, std::string>* outNameByTexture = nullptr)
 {
 	std::vector<EmbeddedTextureFile> files;
 	if (scene == nullptr || scene->mNumTextures == 0 || scene->mTextures == nullptr) {
@@ -161,6 +292,9 @@ static std::vector<EmbeddedTextureFile> ExtractEmbeddedTextures (aiScene* scene,
 		fileName = prefix + fileName;
 		usedNames.insert (fileName);
 		nameByTexture[tex] = fileName;
+		if (outNameByTexture != nullptr) {
+			(*outNameByTexture)[tex] = fileName;
+		}
 
 		size_t size = 0;
 		const std::uint8_t* src = nullptr;
@@ -210,6 +344,167 @@ static std::vector<EmbeddedTextureFile> ExtractEmbeddedTextures (aiScene* scene,
 	}
 
 	return files;
+}
+
+static aiString MakeTextureName (const std::string& name)
+{
+	return aiString (name);
+}
+
+struct TextureNamingContext
+{
+	std::string project;
+	bool multiPart = false;
+	std::unordered_map<unsigned int, std::string> partNameByMaterial; // material index -> part name
+	std::unordered_map<const aiTexture*, std::string> embeddedOriginal;
+	std::unordered_map<const aiTexture*, std::string> embeddedNew;
+};
+
+static std::string ToPartName (const std::string& raw)
+{
+	if (raw.empty ()) {
+		return "part";
+	}
+	std::string res = raw;
+	for (char& c : res) {
+		if (!(std::isalnum (static_cast<unsigned char>(c)) || c == '_' || c == '-')) {
+			c = '_';
+		}
+	}
+	return res;
+}
+
+static std::string ComposeTexBase (const TextureNamingContext& ctx, const std::string& part)
+{
+	if (ctx.multiPart && !part.empty ()) {
+		return ctx.project + "_" + part;
+	}
+	return ctx.project;
+}
+
+static void RenameMaterialTextures (
+	aiScene* scene,
+	TextureNamingContext& naming,
+	std::vector<EmbeddedTextureFile>& embeddedFiles)
+{
+	if (scene == nullptr) {
+		return;
+	}
+	for (unsigned int mi = 0; mi < scene->mNumMaterials; ++mi) {
+		aiMaterial* mat = scene->mMaterials[mi];
+		if (mat == nullptr) {
+			continue;
+		}
+		std::string partName;
+		auto it = naming.partNameByMaterial.find (mi);
+		if (it != naming.partNameByMaterial.end ()) {
+			partName = it->second;
+		}
+		std::string base = ComposeTexBase (naming, partName);
+
+		auto processType = [&](aiTextureType t, const std::string& suffix) {
+			const unsigned int texCount = mat->GetTextureCount (t);
+			for (unsigned int ti = 0; ti < texCount; ++ti) {
+				aiString texPath;
+				if (mat->GetTexture (t, ti, &texPath) != aiReturn_SUCCESS) {
+					continue;
+				}
+				std::string newName = base + suffix;
+				// preserve extension if present
+				std::string pathStr = texPath.C_Str ();
+				size_t dot = pathStr.find_last_of ('.');
+				std::string ext = (dot != std::string::npos) ? pathStr.substr (dot) : std::string ();
+				// For embedded texture (*N) paths with no extension, derive from achFormatHint
+				if (ext.empty ()) {
+					const aiTexture* embTex = scene->GetEmbeddedTexture (pathStr.c_str ());
+					if (embTex != nullptr && embTex->achFormatHint[0] != '\0') {
+						ext = std::string (".") + embTex->achFormatHint;
+						for (char& c : ext) {
+							if (c != '.') c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
+						}
+					}
+				}
+				if (!ext.empty ()) {
+					newName += ext;
+				}
+				// Find embedded texture by matching path in embeddedOriginal map
+				const aiTexture* embPtr = nullptr;
+				for (const auto& kv : naming.embeddedOriginal) {
+					if (kv.second == pathStr) {
+						embPtr = kv.first;
+						break;
+					}
+				}
+				// Fallback: direct lookup for *N embedded paths (when embeddedOriginal not populated)
+				if (embPtr == nullptr) {
+					auto res = scene->GetEmbeddedTextureAndIndex (pathStr.c_str ());
+					if (res.first != nullptr) {
+						embPtr = res.first;
+					}
+				}
+				if (embPtr != nullptr) {
+					naming.embeddedNew[embPtr] = newName;
+				}
+				aiString newPath = MakeTextureName (newName);
+				mat->AddProperty (&newPath, AI_MATKEY_TEXTURE (t, ti));
+			}
+		};
+
+		processType (aiTextureType_BASE_COLOR, "_basecolor");
+		processType (aiTextureType_DIFFUSE, "_basecolor");
+		processType (aiTextureType_NORMALS, "_normal");
+		processType (aiTextureType_NORMAL_CAMERA, "_normal");
+		processType (aiTextureType_GLTF_METALLIC_ROUGHNESS, "_rm");
+		processType (aiTextureType_UNKNOWN, "_rm"); // catch ORM packed in UNKNOWN
+	}
+
+	// rewrite embedded file names to match
+	for (auto& file : embeddedFiles) {
+		for (auto& kv : naming.embeddedOriginal) {
+			const aiTexture* ptr = kv.first;
+			const std::string& oldName = kv.second;
+			auto newIt = naming.embeddedNew.find (ptr);
+			if (newIt != naming.embeddedNew.end () && file.path == oldName) {
+				file.path = newIt->second;
+			}
+		}
+	}
+}
+
+static void UpdateEmbeddedTextureFilenames (aiScene* scene, const TextureNamingContext& naming)
+{
+	if (scene == nullptr) {
+		return;
+	}
+	for (const auto& kv : naming.embeddedNew) {
+		aiTexture* tex = const_cast<aiTexture*> (kv.first);
+		if (tex != nullptr) {
+			tex->mFilename = aiString (kv.second);
+		}
+	}
+}
+
+static bool HasMultipleMeshParts (const aiScene* scene)
+{
+	if (scene == nullptr || scene->mRootNode == nullptr) {
+		return false;
+	}
+	int meshNodeCount = 0;
+	std::vector<const aiNode*> stack = { scene->mRootNode };
+	while (!stack.empty ()) {
+		const aiNode* n = stack.back ();
+		stack.pop_back ();
+		if (n->mNumMeshes > 0) {
+			++meshNodeCount;
+			if (meshNodeCount > 1) {
+				return true;
+			}
+		}
+		for (unsigned int i = 0; i < n->mNumChildren; ++i) {
+			stack.push_back (n->mChildren[i]);
+		}
+	}
+	return false;
 }
 
 static bool ReplaceFileListWithZip (const FileList& fileList, const std::string& zipName, Result& result)
@@ -712,7 +1007,38 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 #endif
 }
 
-static bool ExportScene (const aiScene* scene, const std::string& format, Result& result)
+static void CollectMaterialParts (const aiScene* scene, TextureNamingContext& ctx)
+{
+	if (scene == nullptr || scene->mRootNode == nullptr) {
+		return;
+	}
+	bool multi = HasMultipleMeshParts (scene);
+	ctx.multiPart = multi;
+	std::unordered_map<unsigned int, std::string> first;
+	std::vector<const aiNode*> stack = { scene->mRootNode };
+	while (!stack.empty ()) {
+		const aiNode* n = stack.back (); stack.pop_back ();
+		if (n->mNumMeshes > 0) {
+			std::string part = ToPartName (n->mName.C_Str ());
+			for (unsigned int i = 0; i < n->mNumMeshes; ++i) {
+				unsigned int mi = n->mMeshes[i];
+				if (mi < scene->mNumMeshes) {
+					const aiMesh* mesh = scene->mMeshes[mi];
+					unsigned int matIdx = mesh ? mesh->mMaterialIndex : 0;
+					if (first.find (matIdx) == first.end ()) {
+						first[matIdx] = part;
+					}
+				}
+			}
+		}
+		for (unsigned int i = 0; i < n->mNumChildren; ++i) {
+			stack.push_back (n->mChildren[i]);
+		}
+	}
+	ctx.partNameByMaterial = std::move (first);
+}
+
+static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
 {
 	if (scene == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -751,11 +1077,19 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		assimpFormat = "stlb";
 	}
 	
+	TextureNamingContext naming;
+	naming.project = projectName.empty () ? std::string ("result") : projectName;
+	CollectMaterialParts (scene, naming);
 	std::vector<EmbeddedTextureFile> extraFiles;
 	if (format == "fbx") {
-		extraFiles = ExtractEmbeddedTextures (mutableScene, "result.fbm");
-	} else if (format == "obj") {
-		extraFiles = ExtractEmbeddedTextures (mutableScene, "");
+		extraFiles = ExtractEmbeddedTextures (mutableScene, "result.fbm", &naming.embeddedOriginal);
+	} else if (format == "obj" || format == "gltf" || format == "gltf2") {
+		extraFiles = ExtractEmbeddedTextures (mutableScene, "", &naming.embeddedOriginal);
+	}
+	RenameMaterialTextures (mutableScene, naming, extraFiles);
+	// For GLB: update embedded texture mFilename so GLTF exporter can find them by name
+	if (format == "glb" || format == "glb2") {
+		UpdateEmbeddedTextureFilenames (mutableScene, naming);
 	}
 
 	aiReturn exportResult = aiReturn_FAILURE;
@@ -797,7 +1131,46 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	return true;
 }
 
-Result ConvertFile (const File& file, const std::string& format, const FileLoader& loader)
+static bool ApplyMetadata (aiScene* scene, const MetadataOptions* meta)
+{
+	if (scene == nullptr || meta == nullptr) {
+		return true;
+	}
+
+	if (!meta->rootTransform.empty ()) {
+		aiMatrix4x4 m;
+		if (TryCreateMatrix4 (meta->rootTransform, m)) {
+			ApplyTransformToRootNode (scene, m);
+		}
+	}
+
+	if (!meta->childTransforms.empty ()) {
+		NodeTransformMap map;
+		for (const auto& kv : meta->childTransforms) {
+			aiMatrix4x4 m;
+			if (TryCreateMatrix4 (kv.second, m)) {
+				map.emplace (kv.first, m);
+			}
+		}
+		if (!map.empty ()) {
+			ApplyTransformsToNodesByName (scene->mRootNode, map);
+		}
+	}
+
+	// children_rename is intentionally disabled.
+
+	if (!meta->childDeleted.empty ()) {
+		DeleteNodesByName (scene->mRootNode, meta->childDeleted);
+	}
+
+	if (meta->hasMaterialFactors) {
+		ApplyMaterialFactors (scene, meta->metallic, meta->roughness);
+	}
+
+	return true;
+}
+
+Result ConvertFile (const File& file, const std::string& format, const FileLoader& loader, const MetadataOptions* metadata, const std::string& projectName)
 {
 	Assimp::Importer importer;
 	importer.SetIOHandler (new DelayLoadedIOSystemReadAdapter (file, loader));
@@ -805,11 +1178,13 @@ Result ConvertFile (const File& file, const std::string& format, const FileLoade
 	const aiScene* scene = ImportFileListByMainFile (importer, file, flags);
 
 	Result result;
-	ExportScene (scene, format, result);
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	ApplyMetadata (mutableScene, metadata);
+	ExportScene (mutableScene, format, result, projectName);
 	return result;
 }
 
-Result ConvertFileList (const FileList& fileList, const std::string& format)
+Result ConvertFileList (const FileList& fileList, const std::string& format, const MetadataOptions* metadata, const std::string& projectName)
 {
 	if (fileList.FileCount () == 0) {
 		return Result (ErrorCode::NoFilesFound);
@@ -829,18 +1204,90 @@ Result ConvertFileList (const FileList& fileList, const std::string& format)
 	}
 
 	Result result;
-	ExportScene (scene, format, result);
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	ApplyMetadata (mutableScene, metadata);
+	ExportScene (mutableScene, format, result, projectName);
+	return result;
+}
+
+Result ConvertFileListWithTransform (const FileList& fileList, const std::string& format, const std::vector<float>& matrix16, const MetadataOptions* metadata, const std::string& projectName)
+{
+	if (fileList.FileCount () == 0) {
+		return Result (ErrorCode::NoFilesFound);
+	}
+
+	aiMatrix4x4 transform;
+	if (!TryCreateMatrix4 (matrix16, transform)) {
+		return Result (ErrorCode::UnknownError);
+	}
+
+	Assimp::Importer importer;
+	importer.SetIOHandler (new FileListIOSystemReadAdapter (fileList));
+	const unsigned int flags = GetImportFlagsForFormat (format);
+
+	const aiScene* scene = nullptr;
+	for (size_t fileIndex = 0; fileIndex < fileList.FileCount (); fileIndex++) {
+		const File& file = fileList.GetFile (fileIndex);
+		scene = ImportFileListByMainFile (importer, file, flags);
+		if (scene != nullptr) {
+			break;
+		}
+	}
+
+	Result result;
+	if (!ApplyTransformToRootNode (scene, transform)) {
+		result.errorCode = ErrorCode::ImportError;
+		return result;
+	}
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	ApplyMetadata (mutableScene, metadata);
+	ExportScene (mutableScene, format, result, projectName);
+	return result;
+}
+
+Result ConvertFileListWithNodeTransforms (const FileList& fileList, const std::string& format, const NodeTransformMap& transformByName, const MetadataOptions* metadata, const std::string& projectName)
+{
+	if (fileList.FileCount () == 0) {
+		return Result (ErrorCode::NoFilesFound);
+	}
+
+	Assimp::Importer importer;
+	importer.SetIOHandler (new FileListIOSystemReadAdapter (fileList));
+	const unsigned int flags = GetImportFlagsForFormat (format);
+
+	const aiScene* scene = nullptr;
+	for (size_t fileIndex = 0; fileIndex < fileList.FileCount (); fileIndex++) {
+		const File& file = fileList.GetFile (fileIndex);
+		scene = ImportFileListByMainFile (importer, file, flags);
+		if (scene != nullptr) {
+			break;
+		}
+	}
+
+	Result result;
+	if (scene == nullptr) {
+		result.errorCode = ErrorCode::ImportError;
+		return result;
+	}
+	ApplyTransformsToNodesByName (scene->mRootNode, transformByName);
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	ApplyMetadata (mutableScene, metadata);
+	ExportScene (mutableScene, format, result, projectName);
 	return result;
 }
 
 #ifdef EMSCRIPTEN
+
+static bool TryReadMetadata (const emscripten::val& input, MetadataOptions& meta);
 
 Result ConvertFileEmscripten (
 	const std::string& name,
 	const std::string& format,
 	const emscripten::val& content,
 	const emscripten::val& existsFunc,
-	const emscripten::val& loadFunc)
+	const emscripten::val& loadFunc,
+	const emscripten::val& metadataInput = emscripten::val::undefined (),
+	const std::string& projectName = std::string ())
 {
 	class FileLoaderEmscripten : public FileLoader
 	{
@@ -879,7 +1326,271 @@ Result ConvertFileEmscripten (
 	Buffer buffer = emscripten::vecFromJSArray<std::uint8_t> (content);
 	File file (name, buffer);
 	FileLoaderEmscripten loader (existsFunc, loadFunc);
-	return ConvertFile (file, format, loader);
+	MetadataOptions metadata;
+	bool hasMeta = TryReadMetadata (metadataInput, metadata);
+	return ConvertFile (file, format, loader, hasMeta ? &metadata : nullptr, projectName);
+}
+
+Result ConvertFileEmscriptenV1 (
+	const std::string& name,
+	const std::string& format,
+	const emscripten::val& content,
+	const emscripten::val& existsFunc,
+	const emscripten::val& loadFunc)
+{
+	return ConvertFileEmscripten (name, format, content, existsFunc, loadFunc, emscripten::val::undefined (), std::string ());
+}
+
+Result ConvertFileListEmscripten (
+	const FileList& fileList,
+	const std::string& format,
+	const emscripten::val& metadataInput = emscripten::val::undefined (),
+	const std::string& projectName = std::string ())
+{
+	MetadataOptions metadata;
+	bool hasMeta = TryReadMetadata (metadataInput, metadata);
+	return ConvertFileList (fileList, format, hasMeta ? &metadata : nullptr, projectName);
+}
+
+Result ConvertFileListEmscriptenV1 (
+	const FileList& fileList,
+	const std::string& format)
+{
+	return ConvertFileList (fileList, format, nullptr, std::string ());
+}
+
+static bool TryReadTransformMatrix (const emscripten::val& matrixInput, std::vector<float>& matrix16)
+{
+	if (matrixInput.isUndefined () || matrixInput.isNull ()) {
+		return false;
+	}
+
+	emscripten::val lengthValue = matrixInput["length"];
+	if (lengthValue.isUndefined () || lengthValue.isNull ()) {
+		return false;
+	}
+
+	unsigned int length = 0;
+	try {
+		length = lengthValue.as<unsigned int> ();
+	} catch (...) {
+		return false;
+	}
+	if (length != 16) {
+		return false;
+	}
+
+	matrix16.clear ();
+	matrix16.reserve (16);
+	for (unsigned int index = 0; index < 16; ++index) {
+		double value = 0.0;
+		try {
+			value = matrixInput[index].as<double> ();
+		} catch (...) {
+			return false;
+		}
+		if (!std::isfinite (value)) {
+			return false;
+		}
+		matrix16.push_back (static_cast<float> (value));
+	}
+	return true;
+}
+
+static bool TryReadNodeTransformMap (const emscripten::val& transformInput, NodeTransformMap& transformByName)
+{
+	if (transformInput.isUndefined () || transformInput.isNull ()) {
+		return false;
+	}
+
+	emscripten::val objectValue = emscripten::val::global ("Object");
+	emscripten::val keys = objectValue.call<emscripten::val> ("keys", transformInput);
+	if (keys.isUndefined () || keys.isNull ()) {
+		return false;
+	}
+
+	emscripten::val lengthValue = keys["length"];
+	if (lengthValue.isUndefined () || lengthValue.isNull ()) {
+		return false;
+	}
+
+	unsigned int length = 0;
+	try {
+		length = lengthValue.as<unsigned int> ();
+	} catch (...) {
+		return false;
+	}
+
+	transformByName.clear ();
+	transformByName.reserve (length);
+	for (unsigned int index = 0; index < length; ++index) {
+		std::string nodeName;
+		try {
+			nodeName = keys[index].as<std::string> ();
+		} catch (...) {
+			return false;
+		}
+		std::vector<float> matrix16;
+		if (!TryReadTransformMatrix (transformInput[nodeName], matrix16)) {
+			return false;
+		}
+		aiMatrix4x4 matrix;
+		if (!TryCreateMatrix4 (matrix16, matrix)) {
+			return false;
+		}
+		transformByName.emplace (nodeName, matrix);
+	}
+
+	return true;
+}
+
+static bool TryReadString (const emscripten::val& v, std::string& out)
+{
+	if (v.isUndefined () || v.isNull ()) {
+		return false;
+	}
+	try {
+		out = v.as<std::string> ();
+	} catch (...) {
+		return false;
+	}
+	return true;
+}
+
+static bool TryReadFloat (const emscripten::val& v, float& out)
+{
+	if (v.isUndefined () || v.isNull ()) {
+		return false;
+	}
+	try {
+		double d = v.as<double> ();
+		if (!std::isfinite (d)) {
+			return false;
+		}
+		out = static_cast<float> (d);
+	} catch (...) {
+		return false;
+	}
+	return true;
+}
+
+static bool TryReadMetadata (const emscripten::val& input, MetadataOptions& meta)
+{
+	if (input.isUndefined () || input.isNull ()) {
+		return false;
+	}
+	bool any = false;
+	if (input.hasOwnProperty ("transform_matrix")) {
+		TryReadTransformMatrix (input["transform_matrix"], meta.rootTransform);
+		any = any || !meta.rootTransform.empty ();
+	}
+	if (input.hasOwnProperty ("children_transform_matrix")) {
+		emscripten::val ctm = input["children_transform_matrix"];
+		emscripten::val keys = emscripten::val::global ("Object").call<emscripten::val> ("keys", ctm);
+		unsigned int len = keys["length"].as<unsigned int> ();
+		for (unsigned int i = 0; i < len; ++i) {
+			std::string key = keys[i].as<std::string> ();
+			std::vector<float> m;
+			if (TryReadTransformMatrix (ctm[key], m)) {
+				meta.childTransforms.emplace (key, m);
+			}
+		}
+		any = any || !meta.childTransforms.empty ();
+	}
+	if (input.hasOwnProperty ("children_rename")) {
+		emscripten::val cr = input["children_rename"];
+		emscripten::val keys = emscripten::val::global ("Object").call<emscripten::val> ("keys", cr);
+		unsigned int len = keys["length"].as<unsigned int> ();
+		for (unsigned int i = 0; i < len; ++i) {
+			std::string key = keys[i].as<std::string> ();
+			std::string val;
+			if (TryReadString (cr[key], val)) {
+				meta.childRenames.emplace (key, val);
+			}
+		}
+		any = any || !meta.childRenames.empty ();
+	}
+	if (input.hasOwnProperty ("children_deleted")) {
+		emscripten::val cd = input["children_deleted"];
+		unsigned int len = 0;
+		try { len = cd["length"].as<unsigned int> (); } catch (...) { len = 0; }
+		for (unsigned int i = 0; i < len; ++i) {
+			std::string name;
+			if (TryReadString (cd[i], name)) {
+				meta.childDeleted.insert (name);
+			}
+		}
+		any = any || !meta.childDeleted.empty ();
+	}
+	if (input.hasOwnProperty ("material_factor")) {
+		emscripten::val mf = input["material_factor"];
+		float m = 0.0f, r = 0.5f;
+		bool hm = TryReadFloat (mf["metallic"], m);
+		bool hr = TryReadFloat (mf["roughness"], r);
+		if (hm || hr) {
+			meta.hasMaterialFactors = true;
+			meta.metallic = m;
+			meta.roughness = r;
+			any = true;
+		}
+	}
+	return any;
+}
+
+Result ConvertFileListWithTransformEmscripten (
+	const FileList& fileList,
+	const std::string& format,
+	const emscripten::val& matrixInput,
+	const emscripten::val& metadataInput = emscripten::val::undefined (),
+	const std::string& projectName = std::string ())
+{
+	std::vector<float> matrix16;
+	if (!TryReadTransformMatrix (matrixInput, matrix16)) {
+		return Result (ErrorCode::UnknownError);
+	}
+	MetadataOptions metadata;
+	bool hasMeta = TryReadMetadata (metadataInput, metadata);
+	return ConvertFileListWithTransform (fileList, format, matrix16, hasMeta ? &metadata : nullptr, projectName);
+}
+
+Result ConvertFileListWithTransformEmscriptenV1 (
+	const FileList& fileList,
+	const std::string& format,
+	const emscripten::val& matrixInput)
+{
+	std::vector<float> matrix16;
+	if (!TryReadTransformMatrix (matrixInput, matrix16)) {
+		return Result (ErrorCode::UnknownError);
+	}
+	return ConvertFileListWithTransform (fileList, format, matrix16, nullptr, std::string ());
+}
+
+Result ConvertFileListWithNodeTransformsEmscripten (
+	const FileList& fileList,
+	const std::string& format,
+	const emscripten::val& transformInput,
+	const emscripten::val& metadataInput = emscripten::val::undefined (),
+	const std::string& projectName = std::string ())
+{
+	NodeTransformMap transformByName;
+	if (!TryReadNodeTransformMap (transformInput, transformByName)) {
+		return Result (ErrorCode::UnknownError);
+	}
+	MetadataOptions metadata;
+	bool hasMeta = TryReadMetadata (metadataInput, metadata);
+	return ConvertFileListWithNodeTransforms (fileList, format, transformByName, hasMeta ? &metadata : nullptr, projectName);
+}
+
+Result ConvertFileListWithNodeTransformsEmscriptenV1 (
+	const FileList& fileList,
+	const std::string& format,
+	const emscripten::val& transformInput)
+{
+	NodeTransformMap transformByName;
+	if (!TryReadNodeTransformMap (transformInput, transformByName)) {
+		return Result (ErrorCode::UnknownError);
+	}
+	return ConvertFileListWithNodeTransforms (fileList, format, transformByName, nullptr, std::string ());
 }
 
 EMSCRIPTEN_BINDINGS (assimpjs)
@@ -903,8 +1614,14 @@ EMSCRIPTEN_BINDINGS (assimpjs)
 		.function ("GetFile", &Result::GetFile)
 	;
 
-	emscripten::function<Result, const std::string&, const std::string&, const emscripten::val&, const emscripten::val&, const emscripten::val&> ("ConvertFile", &ConvertFileEmscripten);
-	emscripten::function<Result, const FileList&, const std::string&> ("ConvertFileList", &ConvertFileList);
+	emscripten::function ("ConvertFile", &ConvertFileEmscriptenV1);
+	emscripten::function ("ConvertFile", &ConvertFileEmscripten);
+	emscripten::function ("ConvertFileList", &ConvertFileListEmscriptenV1);
+	emscripten::function ("ConvertFileList", &ConvertFileListEmscripten);
+	emscripten::function ("ConvertFileListWithTransform", &ConvertFileListWithTransformEmscriptenV1);
+	emscripten::function ("ConvertFileListWithTransform", &ConvertFileListWithTransformEmscripten);
+	emscripten::function ("ConvertFileListWithNodeTransforms", &ConvertFileListWithNodeTransformsEmscriptenV1);
+	emscripten::function ("ConvertFileListWithNodeTransforms", &ConvertFileListWithNodeTransformsEmscripten);
 }
 
 #endif

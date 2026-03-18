@@ -11,6 +11,13 @@ const logEl = document.getElementById("log");
 const outputsEl = document.getElementById("outputs");
 const convertBtn = document.getElementById("convertBtn");
 const clearBtn = document.getElementById("clearBtn");
+const projectNameInput = document.getElementById("projectName");
+const metallicInput = document.getElementById("metallic");
+const roughnessInput = document.getElementById("roughness");
+const transformMatrixInput = document.getElementById("transformMatrix");
+const childrenRenameInput = document.getElementById("childrenRename");
+const childrenDeletedInput = document.getElementById("childrenDeleted");
+const childrenTransformMatrixInput = document.getElementById("childrenTransformMatrix");
 
 const mainExtensions = new Set(["glb", "gltf", "fbx"]);
 
@@ -95,6 +102,56 @@ function downloadFile(content, filename) {
   URL.revokeObjectURL(url);
 }
 
+function parseJsonInput(value, fallback) {
+  if (!value || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    throw new Error(`Invalid JSON: ${error.message}`);
+  }
+}
+
+function buildMetadata() {
+  const meta = {};
+  let hasAny = false;
+
+  const transformMatrix = parseJsonInput(transformMatrixInput.value, null);
+  if (transformMatrix) {
+    meta.transform_matrix = transformMatrix;
+    hasAny = true;
+  }
+
+  const childrenRename = parseJsonInput(childrenRenameInput.value, null);
+  if (childrenRename) {
+    meta.children_rename = childrenRename;
+    hasAny = true;
+  }
+
+  const childrenDeleted = parseJsonInput(childrenDeletedInput.value, null);
+  if (childrenDeleted) {
+    meta.children_deleted = childrenDeleted;
+    hasAny = true;
+  }
+
+  const childrenTransformMatrix = parseJsonInput(childrenTransformMatrixInput.value, null);
+  if (childrenTransformMatrix) {
+    meta.children_transform_matrix = childrenTransformMatrix;
+    hasAny = true;
+  }
+
+  const metallicValue = metallicInput.value.trim();
+  const roughnessValue = roughnessInput.value.trim();
+  if (metallicValue !== "" || roughnessValue !== "") {
+    meta.material_factor = {
+      metallic: metallicValue === "" ? 0 : parseFloat(metallicValue),
+      roughness: roughnessValue === "" ? 0.5 : parseFloat(roughnessValue)
+    };
+    hasAny = true;
+  }
+
+  return hasAny ? meta : undefined;
+}
+
 async function convertFiles() {
   if (!state.ajs) {
     setStatus("WASM not ready", "error");
@@ -120,8 +177,18 @@ async function convertFiles() {
       fileList.AddFile(state.files[idx].name, new Uint8Array(buffer));
     });
 
+    let metadata = undefined;
+    try {
+      metadata = buildMetadata();
+    } catch (err) {
+      setStatus("Metadata JSON error", "error");
+      logLine(err.message || String(err));
+      return;
+    }
+    const projectName = (projectNameInput.value || "").trim();
+
     const start = performance.now();
-    const result = state.ajs.ConvertFileList(fileList, format);
+    const result = state.ajs.ConvertFileList(fileList, format, metadata, projectName);
     const elapsed = Math.round(performance.now() - start);
 
     if (!result.IsSuccess()) {

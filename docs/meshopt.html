@@ -67,6 +67,44 @@
                 <input type="radio" name="format" value="3mf" /> 3MF
               </label>
             </div>
+            <div class="meta-panel">
+              <h3>Metadata</h3>
+              <label class="field">
+                <span>Project name</span>
+                <input id="projectName" type="text" placeholder="result" />
+              </label>
+              <div class="field-row">
+                <label class="field">
+                  <span>Metallic</span>
+                  <input id="metallic" type="number" step="0.01" min="0" max="1" placeholder="0" />
+                </label>
+                <label class="field">
+                  <span>Roughness</span>
+                  <input id="roughness" type="number" step="0.01" min="0" max="1" placeholder="0.5" />
+                </label>
+              </div>
+              <label class="field">
+                <span>Root transform matrix (JSON array length 16)</span>
+                <textarea id="transformMatrix" rows="2" placeholder="[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]"></textarea>
+              </label>
+              <label class="field">
+                <span>Children rename (JSON object)</span>
+                <textarea id="childrenRename" rows="2" placeholder="{\"nodeA\":\"partA\"}"></textarea>
+              </label>
+              <label class="field">
+                <span>Children deleted (JSON array)</span>
+                <textarea id="childrenDeleted" rows="2" placeholder="[\"nodeToRemove\"]"></textarea>
+              </label>
+              <label class="field">
+                <span>Children transform matrix (JSON object)</span>
+                <textarea id="childrenTransformMatrix" rows="2" placeholder="{\"nodeA\":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]}"></textarea>
+              </label>
+              <p class="hint">
+                Texture naming uses project name: <strong>project_basecolor</strong>,
+                <strong>project_rm</strong>, <strong>project_normal</strong>, and
+                multi-part names as <strong>project_part_basecolor</strong>.
+              </p>
+            </div>
             <div class="actions">
               <button id="convertBtn">Convert</button>
               <button id="clearBtn" class="ghost">Clear</button>

@@ -253,7 +253,7 @@ it ('Delay load', function () {
 });
 
 it ('glTF export', function () {
-	let files = ['OBJ/cube_usemtl.obj', 'OBJ/cube_usemtl.mtl'];
+	let files = ['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'];
 	let fileList = new ajsMini.FileList ();
 	for (let i = 0; i < files.length; i++) {
 		let filePath = GetTestFileLocation (files[i]);
@@ -272,6 +272,31 @@ it ('glTF export', function () {
 		assert.equal (result.FileCount (), 1);
 		assert.equal (result.GetFile (0).GetPath (), 'result.glb');
 	}
+});
+
+it ('metadata and naming parameters are accepted', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+		return;
+	}
+	let files = ['OBJ/cube_usemtl.obj', 'OBJ/cube_usemtl.mtl'];
+	let fileList = new ajsMeshopt.FileList ();
+	for (let i = 0; i < files.length; i++) {
+		let filePath = GetTestFileLocation (files[i]);
+		fileList.AddFile (filePath, fs.readFileSync (filePath))
+	}
+	const meta = {
+		transform_matrix: [1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			0, 0, 0, 1],
+		children_deleted: [],
+		children_rename: {},
+		children_transform_matrix: {},
+		material_factor: { metallic: 0.0, roughness: 0.5 }
+	};
+	let result = ajsMeshopt.ConvertFileList (fileList, 'gltf2', meta, 'demoProject');
+	assert (result && typeof result.IsSuccess === 'function');
 });
 
 it ('3D', function () {
@@ -904,6 +929,9 @@ it ('Meshopt GLB Import', function () {
 		this.skip ();
 	}
 	const meshoptPath = GetFixtureFileLocation ('BoxTextured-meshopt-nofallback.glb');
+	if (!fs.existsSync (meshoptPath)) {
+		this.skip ();
+	}
 	let fileList = new ajsMeshopt.FileList ();
 	fileList.AddFile (meshoptPath, fs.readFileSync (meshoptPath));
 	let result = ajsMeshopt.ConvertFileList (fileList, 'obj');
@@ -925,5 +953,68 @@ it ('USD Export (TinyUSDZ)', function () {
 	let content = Buffer.from (usdFile.GetContent ());
 	let header = content.toString ('utf8', 0, 16);
 	assert (header.includes ('PXR-USDC'));
+});
+
+it ('Export With Transform Matrix', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let matrix16 = [
+		1, 0, 0, 0,
+		0, 1, 0, 2,
+		0, 0, 1, 0,
+		0, 0, 0, 1
+	];
+	let result = ajsMeshopt.ConvertFileListWithTransform (fileList, 'obj', matrix16);
+	assert (result.IsSuccess ());
+	assert (result.FileCount () > 0);
+});
+
+it ('Export With Transform Matrix - Invalid Matrix', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let result = ajsMeshopt.ConvertFileListWithTransform (fileList, 'obj', [1, 0, 0]);
+	assert (!result.IsSuccess ());
+});
+
+it ('Export With Node Transform Matrix Map', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let transformByNodeName = {
+		Mesh: [
+			1, 0, 0, 0,
+			0, 1, 0, 2,
+			0, 0, 1, 0,
+			0, 0, 0, 1
+		],
+	};
+	let result = ajsMeshopt.ConvertFileListWithNodeTransforms (fileList, 'obj', transformByNodeName);
+	assert (result.IsSuccess ());
+	assert (result.FileCount () > 0);
+});
+
+it ('Export With Node Transform Matrix Map - Invalid Matrix', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let transformByNodeName = {
+		Mesh: [1, 0, 0],
+	};
+	let result = ajsMeshopt.ConvertFileListWithNodeTransforms (fileList, 'obj', transformByNodeName);
+	assert (!result.IsSuccess ());
 });
 });
