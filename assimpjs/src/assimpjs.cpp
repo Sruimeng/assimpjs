@@ -143,6 +143,24 @@ static bool DeleteNodesByName (aiNode* node, const std::unordered_set<std::strin
 	return removed;
 }
 
+static void SyncMeshNamesFromNodes (const aiNode* node, aiScene* scene)
+{
+	if (!node) return;
+	const std::string name (node->mName.C_Str ());
+	const bool isMeaningful = !name.empty () && name != "RootNode" && name != "Scene";
+	if (isMeaningful) {
+		for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+			unsigned int meshIdx = node->mMeshes[i];
+			if (meshIdx < scene->mNumMeshes) {
+				scene->mMeshes[meshIdx]->mName = node->mName;
+			}
+		}
+	}
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		SyncMeshNamesFromNodes (node->mChildren[i], scene);
+	}
+}
+
 static void ApplyMaterialFactors (aiScene* scene, float metallic, float roughness)
 {
 	if (scene == nullptr) {
@@ -1254,6 +1272,36 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	}
 
 	if (format == "usd" || format == "usdc") {
+		// If there are embedded textures, package USDA + textures as USDZ.
+		// (Skip USDC conversion to avoid data loss in LoadUSDAFromMemory roundtrip)
+		if (!renderScene.images.empty ()) {
+			std::vector<USDZEntry> entries;
+			std::vector<uint8_t> usdaBytes (usdaStr.begin (), usdaStr.end ());
+			entries.push_back ({"model.usda", usdaBytes});
+			for (size_t i = 0; i < renderScene.images.size (); ++i) {
+				const auto& img = renderScene.images[i];
+				if (img.buffer_id < 0 ||
+					static_cast<size_t> (img.buffer_id) >= renderScene.buffers.size ()) {
+					continue;
+				}
+				const auto& buf = renderScene.buffers[static_cast<size_t> (img.buffer_id)];
+				entries.push_back ({img.asset_identifier, buf.data});
+			}
+			std::vector<uint8_t> usdz;
+			if (CreateUSDZ (entries, usdz)) {
+				Buffer content (usdz.begin (), usdz.end ());
+				result.fileList.AddFile ("model.usdz", content);
+				result.errorCode = ErrorCode::NoError;
+				return true;
+			}
+			// CreateUSDZ failed — fall through to plain USDA output.
+			Buffer content (usdaStr.begin (), usdaStr.end ());
+			result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
+			result.errorCode = ErrorCode::NoError;
+			return true;
+		}
+
+		// No textures: try USDC conversion for binary format.
 		tinyusdz::Stage stage;
 		tinyusdz::USDLoadOptions loadOptions;
 		loadOptions.load_assets = false;
@@ -1285,29 +1333,6 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 			result.fileList.AddFile (GetFileNameFromFormat ("usd"), content);
 			result.errorCode = ErrorCode::NoError;
 			return true;
-		}
-
-		// If there are embedded textures, package everything as USDZ.
-		if (!renderScene.images.empty ()) {
-			std::vector<USDZEntry> entries;
-			entries.push_back ({"model.usdc", usdc}); // copy; usdc also used below
-			for (size_t i = 0; i < renderScene.images.size (); ++i) {
-				const auto& img = renderScene.images[i];
-				if (img.buffer_id < 0 ||
-					static_cast<size_t> (img.buffer_id) >= renderScene.buffers.size ()) {
-					continue;
-				}
-				const auto& buf = renderScene.buffers[static_cast<size_t> (img.buffer_id)];
-				entries.push_back ({img.asset_identifier, buf.data});
-			}
-			std::vector<uint8_t> usdz;
-			if (CreateUSDZ (entries, usdz)) {
-				Buffer content (usdz.begin (), usdz.end ());
-				result.fileList.AddFile ("model.usdz", content);
-				result.errorCode = ErrorCode::NoError;
-				return true;
-			}
-			// CreateUSDZ failed — fall through to plain USDC output.
 		}
 
 		Buffer content (usdc.begin (), usdc.end ());
@@ -1408,6 +1433,20 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	// For GLB: update embedded texture mFilename so GLTF exporter can find them by name
 	if (format == "glb" || format == "glb2") {
 		UpdateEmbeddedTextureFilenames (mutableScene, naming);
+	}
+
+	if (format == "fbx" || format == "obj") {
+		// 从子节点开始遍历，跳过根节点（根节点名通常为 "result"/"Scene" 等无意义值）
+		for (unsigned int i = 0; i < scene->mRootNode->mNumChildren; ++i) {
+			SyncMeshNamesFromNodes (scene->mRootNode->mChildren[i], mutableScene);
+		}
+	}
+
+	if (format == "stl") {
+		// GLB 是 Y-up，STL 工具通常期望 Z-up，补偿 +90° X 旋转
+		aiMatrix4x4 rotX;
+		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
+		mutableScene->mRootNode->mTransformation = rotX * mutableScene->mRootNode->mTransformation;
 	}
 
 	aiReturn exportResult = aiReturn_FAILURE;
