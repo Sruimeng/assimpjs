@@ -951,8 +951,11 @@ it ('USD Export (TinyUSDZ)', function () {
 	assert (result.FileCount () > 0);
 	let usdFile = result.GetFile (0);
 	let content = Buffer.from (usdFile.GetContent ());
-	let header = content.toString ('utf8', 0, 16);
-	assert (header.includes ('PXR-USDC'));
+	// Textured models → USDZ (zip); untextured models → USDC binary
+	let header4 = content.toString ('binary', 0, 4);
+	let isUsdz = header4[0] === 'P' && header4[1] === 'K';
+	let isUsdc = content.toString ('utf8', 0, 8).includes ('PXR-USDC');
+	assert (isUsdz || isUsdc, 'Expected USDZ or USDC output');
 });
 
 it ('Export With Transform Matrix', function () {

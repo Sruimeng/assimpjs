@@ -823,6 +823,178 @@ struct MeshInstance
 	std::string name;
 };
 
+// ── USDZ packing helpers ────────────────────────────────────────────────────
+
+static uint32_t CalcCrc32 (const uint8_t* data, size_t len)
+{
+	uint32_t crc = 0xFFFFFFFFu;
+	while (len--) {
+		crc ^= *data++;
+		for (int k = 0; k < 8; ++k)
+			crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
+	}
+	return crc ^ 0xFFFFFFFFu;
+}
+
+static void AppendLE16 (std::vector<uint8_t>& v, uint16_t x)
+{
+	v.push_back (static_cast<uint8_t> (x));
+	v.push_back (static_cast<uint8_t> (x >> 8));
+}
+
+static void AppendLE32 (std::vector<uint8_t>& v, uint32_t x)
+{
+	v.push_back (static_cast<uint8_t> (x));
+	v.push_back (static_cast<uint8_t> (x >> 8));
+	v.push_back (static_cast<uint8_t> (x >> 16));
+	v.push_back (static_cast<uint8_t> (x >> 24));
+}
+
+struct USDZEntry { std::string name; std::vector<uint8_t> data; };
+
+// Build a USDZ zip (uncompressed, file data 64-byte aligned) from a list of
+// entries.  The USDC payload must be the first entry.
+static bool CreateUSDZ (const std::vector<USDZEntry>& files, std::vector<uint8_t>& out)
+{
+	struct CdRec { std::string name; uint32_t crc, size, offset; };
+	std::vector<CdRec> cd;
+	cd.reserve (files.size ());
+
+	for (const auto& f : files) {
+		uint32_t crc = CalcCrc32 (f.data.data (), f.data.size ());
+		uint32_t sz  = static_cast<uint32_t> (f.data.size ());
+		uint32_t hdr = static_cast<uint32_t> (out.size ());
+
+		// Local file header: 30 fixed bytes + filename + extra (for alignment).
+		out.push_back (0x50); out.push_back (0x4B);
+		out.push_back (0x03); out.push_back (0x04);
+		AppendLE16 (out, 20);  // version needed
+		AppendLE16 (out, 0);   // flags
+		AppendLE16 (out, 0);   // method: STORE
+		AppendLE16 (out, 0);   // mod time
+		AppendLE16 (out, 0);   // mod date
+		AppendLE32 (out, crc);
+		AppendLE32 (out, sz);
+		AppendLE32 (out, sz);
+		AppendLE16 (out, static_cast<uint16_t> (f.name.size ()));
+		size_t xpos = out.size ();
+		AppendLE16 (out, 0);   // extra length placeholder
+		out.insert (out.end (), f.name.begin (), f.name.end ());
+
+		// Pad extra field so file data starts at a 64-byte boundary.
+		size_t pad = (64 - out.size () % 64) % 64;
+		out[xpos]     = static_cast<uint8_t> (pad);
+		out[xpos + 1] = static_cast<uint8_t> (pad >> 8);
+		out.insert (out.end (), pad, 0u);
+
+		out.insert (out.end (), f.data.begin (), f.data.end ());
+		cd.push_back ({ f.name, crc, sz, hdr });
+	}
+
+	uint32_t cd_off = static_cast<uint32_t> (out.size ());
+	for (const auto& e : cd) {
+		out.push_back (0x50); out.push_back (0x4B);
+		out.push_back (0x01); out.push_back (0x02);
+		AppendLE16 (out, 20); AppendLE16 (out, 20);
+		AppendLE16 (out, 0);  AppendLE16 (out, 0);
+		AppendLE16 (out, 0);  AppendLE16 (out, 0);
+		AppendLE32 (out, e.crc);
+		AppendLE32 (out, e.size);
+		AppendLE32 (out, e.size);
+		AppendLE16 (out, static_cast<uint16_t> (e.name.size ()));
+		AppendLE16 (out, 0);  // extra len
+		AppendLE16 (out, 0);  // comment len
+		AppendLE16 (out, 0);  // disk start
+		AppendLE16 (out, 0);  // internal attrs
+		AppendLE32 (out, 0);  // external attrs
+		AppendLE32 (out, e.offset);
+		out.insert (out.end (), e.name.begin (), e.name.end ());
+	}
+
+	uint32_t cd_sz = static_cast<uint32_t> (out.size ()) - cd_off;
+	out.push_back (0x50); out.push_back (0x4B);
+	out.push_back (0x05); out.push_back (0x06);
+	AppendLE16 (out, 0);
+	AppendLE16 (out, 0);
+	AppendLE16 (out, static_cast<uint16_t> (cd.size ()));
+	AppendLE16 (out, static_cast<uint16_t> (cd.size ()));
+	AppendLE32 (out, cd_sz);
+	AppendLE32 (out, cd_off);
+	AppendLE16 (out, 0);
+	return true;
+}
+
+// ── USD material / texture helpers ─────────────────────────────────────────
+
+// Returns index into out.textures for the given aiMaterial texture slot,
+// creating BufferData / TextureImage / UVTexture entries as needed.
+// Returns -1 if the slot is not present or cannot be embedded.
+static int32_t AddTexture (
+	const aiScene*                           scene,
+	const aiMaterial*                        mat,
+	aiTextureType                            texType,
+	const std::string&                       paramName,
+	std::unordered_map<std::string, int32_t>& cache,
+	tinyusdz::tydra::RenderScene&            rs)
+{
+	aiString texPath;
+	if (mat->GetTexture (texType, 0, &texPath) != AI_SUCCESS) {
+		return -1;
+	}
+
+	const std::string key = texPath.C_Str ();
+	auto it = cache.find (key);
+	if (it != cache.end ()) {
+		return it->second;
+	}
+
+	const aiTexture* aitex = scene->GetEmbeddedTexture (texPath.C_Str ());
+	if (aitex == nullptr || aitex->mHeight != 0) {
+		// Skip external / uncompressed textures.
+		cache[key] = -1;
+		return -1;
+	}
+
+	// Determine file extension from format hint.
+	std::string ext = "png";
+	if (aitex->achFormatHint[0] != '\0') {
+		std::string hint (aitex->achFormatHint);
+		if (hint == "jpg" || hint == "jpeg") ext = "jpg";
+		else if (hint == "png")              ext = "png";
+	}
+
+	// Store raw compressed bytes in a BufferData.
+	tinyusdz::tydra::BufferData buf;
+	buf.componentType = tinyusdz::tydra::ComponentType::UInt8;
+	const uint8_t* raw = reinterpret_cast<const uint8_t*> (aitex->pcData);
+	buf.data.assign (raw, raw + aitex->mWidth);
+
+	int64_t buf_id = static_cast<int64_t> (rs.buffers.size ());
+	rs.buffers.emplace_back (std::move (buf));
+
+	// TextureImage — asset_identifier is the filename inside the USDZ.
+	tinyusdz::tydra::TextureImage img;
+	img.asset_identifier = "textures/" + paramName + "_" +
+		std::to_string (buf_id) + "." + ext;
+	img.buffer_id = buf_id;
+	img.decoded   = false;
+
+	int64_t img_id = static_cast<int64_t> (rs.images.size ());
+	rs.images.emplace_back (std::move (img));
+
+	// UVTexture node.
+	tinyusdz::tydra::UVTexture uvtex;
+	uvtex.prim_name        = "tex_" + paramName + "_" + std::to_string (buf_id);
+	uvtex.texture_image_id = img_id;
+	uvtex.varname_uv       = "st";
+
+	int32_t tex_id = static_cast<int32_t> (rs.textures.size ());
+	rs.textures.emplace_back (std::move (uvtex));
+
+	cache[key] = tex_id;
+	return tex_id;
+}
+
 static void CollectMeshInstances (const aiScene* scene, const aiNode* node, const aiMatrix4x4& parent, std::vector<MeshInstance>& out)
 {
 	aiMatrix4x4 current = parent * node->mTransformation;
@@ -857,10 +1029,125 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 	}
 
 	out.meta.upAxis = "Y";
-	out.meshes.reserve (instances.size ());
 
+	// ── Build materials ──────────────────────────────────────────────────────
+	std::unordered_map<std::string, int32_t> texCache; // aiTex path → texture_id
+	std::unordered_map<std::string, size_t>  matNameCounts;
+	out.materials.reserve (scene->mNumMaterials);
+
+	for (unsigned int mi = 0; mi < scene->mNumMaterials; ++mi) {
+		const aiMaterial* aimat = scene->mMaterials[mi];
+
+		// Material prim name
+		aiString aiName;
+		std::string rawMatName;
+		if (aimat->Get (AI_MATKEY_NAME, aiName) == AI_SUCCESS && aiName.length > 0) {
+			rawMatName = aiName.C_Str ();
+		} else {
+			rawMatName = "mat_" + std::to_string (mi);
+		}
+		size_t matFb = mi;
+		std::string matPrimName = SanitizeUsdIdentifier (rawMatName, matFb, matNameCounts);
+
+		tinyusdz::tydra::RenderMaterial rmat;
+		rmat.name         = matPrimName;
+		rmat.display_name = rawMatName;
+
+		tinyusdz::tydra::PreviewSurfaceShader pss;
+
+		// Base colour (PBR metallic-roughness base color, or diffuse fallback)
+		{
+			aiColor4D col;
+			bool gotColor = false;
+			if (aimat->Get (AI_MATKEY_BASE_COLOR, col) == AI_SUCCESS) {
+				gotColor = true;
+			} else if (aimat->Get (AI_MATKEY_COLOR_DIFFUSE, col) == AI_SUCCESS) {
+				gotColor = true;
+			}
+			if (gotColor) {
+				pss.diffuseColor.value[0] = col.r;
+				pss.diffuseColor.value[1] = col.g;
+				pss.diffuseColor.value[2] = col.b;
+				// opacity from alpha
+				pss.opacity.value = col.a;
+			}
+		}
+
+		// Base colour texture
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_BASE_COLOR,
+				"baseColor", texCache, out);
+			if (tid < 0) {
+				// fall back to legacy diffuse slot
+				tid = AddTexture (scene, aimat, aiTextureType_DIFFUSE,
+					"baseColor", texCache, out);
+			}
+			if (tid >= 0) {
+				pss.diffuseColor.texture_id = tid;
+			}
+		}
+
+		// Metallic factor
+		{
+			float val = 0.0f;
+			if (aimat->Get (AI_MATKEY_METALLIC_FACTOR, val) == AI_SUCCESS) {
+				pss.metallic.value = val;
+			}
+		}
+
+		// Roughness factor
+		{
+			float val = 0.5f;
+			if (aimat->Get (AI_MATKEY_ROUGHNESS_FACTOR, val) == AI_SUCCESS) {
+				pss.roughness.value = val;
+			}
+		}
+
+		// Emissive colour
+		{
+			aiColor3D em;
+			if (aimat->Get (AI_MATKEY_COLOR_EMISSIVE, em) == AI_SUCCESS) {
+				pss.emissiveColor.value[0] = em.r;
+				pss.emissiveColor.value[1] = em.g;
+				pss.emissiveColor.value[2] = em.b;
+			}
+		}
+
+		// Emissive texture
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_EMISSIVE,
+				"emissive", texCache, out);
+			if (tid >= 0) {
+				pss.emissiveColor.texture_id = tid;
+			}
+		}
+
+		// Normal map
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_NORMALS,
+				"normal", texCache, out);
+			if (tid >= 0) {
+				pss.normal.texture_id = tid;
+			}
+		}
+
+		// Opacity
+		{
+			float op = 1.0f;
+			if (aimat->Get (AI_MATKEY_OPACITY, op) == AI_SUCCESS) {
+				pss.opacity.value = op;
+			}
+		}
+
+		rmat.surfaceShader = pss;
+		out.materials.emplace_back (std::move (rmat));
+	}
+
+	// ── Build meshes ─────────────────────────────────────────────────────────
+	out.meshes.reserve (instances.size ());
 	std::unordered_map<std::string, size_t> nameCounts;
 	size_t fallbackIndex = 0;
+
 	for (const MeshInstance& inst : instances) {
 		if (inst.mesh == nullptr) {
 			continue;
@@ -877,6 +1164,11 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		rmesh.prim_name = SanitizeUsdIdentifier (rawName, fallbackIndex++, nameCounts);
 		rmesh.display_name = rawName;
 		rmesh.is_single_indexable = true;
+
+		// Link to material
+		if (inst.mesh->mMaterialIndex < scene->mNumMaterials) {
+			rmesh.material_id = static_cast<int> (inst.mesh->mMaterialIndex);
+		}
 
 		rmesh.points.resize (inst.mesh->mNumVertices);
 		for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
@@ -909,10 +1201,11 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 				normalData.push_back (n.z);
 			}
 			tinyusdz::tydra::VertexAttribute normals;
-			normals.format = tinyusdz::tydra::VertexAttributeFormat::Vec3;
+			normals.format      = tinyusdz::tydra::VertexAttributeFormat::Vec3;
 			normals.variability = tinyusdz::tydra::VertexVariability::Vertex;
 			normals.elementSize = 1;
-			normals.set_buffer (reinterpret_cast<const std::uint8_t*> (normalData.data ()), normalData.size () * sizeof (float));
+			normals.set_buffer (reinterpret_cast<const std::uint8_t*> (normalData.data ()),
+				normalData.size () * sizeof (float));
 			rmesh.normals = std::move (normals);
 		}
 
@@ -924,11 +1217,12 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 				uvData.push_back (inst.mesh->mTextureCoords[0][v].y);
 			}
 			tinyusdz::tydra::VertexAttribute uv;
-			uv.name = "st";
-			uv.format = tinyusdz::tydra::VertexAttributeFormat::Vec2;
+			uv.name        = "st";
+			uv.format      = tinyusdz::tydra::VertexAttributeFormat::Vec2;
 			uv.variability = tinyusdz::tydra::VertexVariability::Vertex;
 			uv.elementSize = 1;
-			uv.set_buffer (reinterpret_cast<const std::uint8_t*> (uvData.data ()), uvData.size () * sizeof (float));
+			uv.set_buffer (reinterpret_cast<const std::uint8_t*> (uvData.data ()),
+				uvData.size () * sizeof (float));
 			rmesh.texcoords[0] = std::move (uv);
 		}
 
@@ -992,6 +1286,30 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 			result.errorCode = ErrorCode::NoError;
 			return true;
 		}
+
+		// If there are embedded textures, package everything as USDZ.
+		if (!renderScene.images.empty ()) {
+			std::vector<USDZEntry> entries;
+			entries.push_back ({"model.usdc", usdc}); // copy; usdc also used below
+			for (size_t i = 0; i < renderScene.images.size (); ++i) {
+				const auto& img = renderScene.images[i];
+				if (img.buffer_id < 0 ||
+					static_cast<size_t> (img.buffer_id) >= renderScene.buffers.size ()) {
+					continue;
+				}
+				const auto& buf = renderScene.buffers[static_cast<size_t> (img.buffer_id)];
+				entries.push_back ({img.asset_identifier, buf.data});
+			}
+			std::vector<uint8_t> usdz;
+			if (CreateUSDZ (entries, usdz)) {
+				Buffer content (usdz.begin (), usdz.end ());
+				result.fileList.AddFile ("model.usdz", content);
+				result.errorCode = ErrorCode::NoError;
+				return true;
+			}
+			// CreateUSDZ failed — fall through to plain USDC output.
+		}
+
 		Buffer content (usdc.begin (), usdc.end ());
 		result.fileList.AddFile (GetFileNameFromFormat (format), content);
 		result.errorCode = ErrorCode::NoError;
