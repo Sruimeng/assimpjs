@@ -1005,6 +1005,12 @@ static int32_t AddTexture (
 	uvtex.prim_name        = "tex_" + paramName + "_" + std::to_string (buf_id);
 	uvtex.texture_image_id = img_id;
 	uvtex.varname_uv       = "st";
+	// Declare output channels for UsdUVTexture
+	uvtex.authoredOutputChannels.insert (tinyusdz::tydra::UVTexture::Channel::RGB);
+	uvtex.authoredOutputChannels.insert (tinyusdz::tydra::UVTexture::Channel::R);
+	uvtex.authoredOutputChannels.insert (tinyusdz::tydra::UVTexture::Channel::G);
+	uvtex.authoredOutputChannels.insert (tinyusdz::tydra::UVTexture::Channel::B);
+	uvtex.authoredOutputChannels.insert (tinyusdz::tydra::UVTexture::Channel::A);
 
 	int32_t tex_id = static_cast<int32_t> (rs.textures.size ());
 	rs.textures.emplace_back (std::move (uvtex));
