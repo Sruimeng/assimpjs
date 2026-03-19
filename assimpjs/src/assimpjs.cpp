@@ -1482,13 +1482,12 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	if (format == "3mf") {
 		// 3MF 需要 X 轴旋转 90 度 + 单位转换
 		// 3MF导出器使用millimeter单位，GLB是meter单位
-		// GLB的米值会直接变成3MF的毫米值，所以需要×100来实现"缩小100倍"的效果
-		// 例如：0.5米 → 0.5mm → ×100 → 50mm（相当于原始500mm缩小10倍，但这是错的）
-		// 正确理解：GLB 0.5米 = 500mm，期望缩小100倍 = 5mm，所以需要 ×10
+		// GLB的米值会直接变成3MF的毫米值（naive），需要 ×100 缩小 10x
+		// 例如：GLB 0.5m → naive 0.5mm → ×100 → 50mm（相当于真实 500mm 缩小 10x）
 		aiMatrix4x4 rotX;
 		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
 		aiMatrix4x4 scale;
-		aiMatrix4x4::Scaling (aiVector3D (10.0f, 10.0f, 10.0f), scale);
+		aiMatrix4x4::Scaling (aiVector3D (100.0f, 100.0f, 100.0f), scale);
 		aiMatrix4x4 transform = scale * rotX;
 
 		// 应用变换到所有mesh的顶点
