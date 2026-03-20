@@ -24,6 +24,7 @@ if (CMAKE_BUILD_TYPE STREQUAL "ReleaseMini" OR CMAKE_BUILD_TYPE STREQUAL "Releas
   # Enable only essential EXPORTERS for import-focused builds
   set (ASSIMP_BUILD_ASSJSON_EXPORTER ON CACHE BOOL "")
   set (ASSIMP_BUILD_GLTF_EXPORTER ON CACHE BOOL "")
+  set (ASSIMP_BUILD_3MF_EXPORTER ON CACHE BOOL "")
 
   ### SKIPPED IMPORTERS ###
   # M3D importer has undefined behaviour because of alignment issues, crashes and memory leaks
@@ -92,6 +93,9 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "ReleaseMeshopt")
   # Optional meshopt decoder
   set (ASSIMP_BUILD_MESHOPT ON CACHE BOOL "")
 
+  # Optional KTX2 decoder
+  set (ASSIMP_BUILD_KTX2_DECODER ON CACHE BOOL "")
+
   # Enable tinyusdz core for USD export path (without assimp USD importer)
   set (ASSIMP_BUILD_USD_IMPORTER OFF CACHE BOOL "" FORCE)
   set (ASSIMP_BUILD_TINYUSDZ ON CACHE BOOL "" FORCE)
@@ -147,6 +151,7 @@ if (${EMSCRIPTEN})
 	
 	# Dynamic memory management for variable file sizes with increased stack for large IFC files
 	target_link_options (AssimpJS PUBLIC -sALLOW_MEMORY_GROWTH=1)   # Allow unlimited memory growth as needed
+	target_link_options (AssimpJS PUBLIC -sINITIAL_MEMORY=67108864) # 64MB 初始堆，减少大文件处理时的内存增长事件次数
 	target_link_options (AssimpJS PUBLIC -sSTACK_SIZE=8MB)       # Increase stack size to 8MB for large IFC files
 	
   # Remove unnecessary runtime features (keeping safe ones)

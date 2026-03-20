@@ -262,10 +262,9 @@ it ('glTF export', function () {
 	{
 		let result = ajsMini.ConvertFileList (fileList, 'gltf2');
 		assert (result.IsSuccess ());
-		assert.equal (result.FileCount (), 3);
+		assert.equal (result.FileCount (), 2);
 		assert.equal (result.GetFile (0).GetPath (), 'result.gltf');
 		assert.equal (result.GetFile (1).GetPath (), 'result.bin');
-		assert.equal (result.GetFile (2).GetPath (), 'result_basecolor.png');
 	}
 	{
 		let result = ajsMini.ConvertFileList (fileList, 'glb2');

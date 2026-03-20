@@ -42,7 +42,13 @@ static unsigned int GetImportFlagsForFormat (const std::string& format)
 		aiProcess_LimitBoneWeights |
 		aiProcess_SortByPType;
 
-	if (format == "glb" || format == "glb2") {
+	// JoinIdenticalVertices 是 O(n log n) 空间哈希，大网格代价高。
+	// 对已有良好顶点共享的格式（GLB/GLTF 输入）或无顶点共享概念的格式禁用。
+	if (format == "glb" || format == "glb2" ||
+	    format == "gltf" || format == "gltf2" ||
+	    format == "stl" || format == "stlb" ||
+	    format == "3mf" ||
+	    format == "usd" || format == "usda" || format == "usdc" || format == "usdz") {
 		flags &= ~aiProcess_JoinIdenticalVertices;
 	}
 
@@ -1496,10 +1502,13 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 			if (mesh != nullptr) {
 				for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
 					mesh->mVertices[v] = transform * mesh->mVertices[v];
-					// 法线也需要变换（使用逆转置矩阵，但对于旋转+均匀缩放，直接用原矩阵即可）
-					if (mesh->mNormals != nullptr) {
-						mesh->mNormals[v] = transform * mesh->mNormals[v];
-						mesh->mNormals[v].Normalize();
+				}
+				// 法线仅需旋转，不需缩放（均匀缩放不改变方向）
+				// 用 rotX 代替 transform，避免 scale×100 后再 Normalize 的 sqrt 开销
+				if (mesh->mNormals != nullptr) {
+					for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+						mesh->mNormals[v] = rotX * mesh->mNormals[v];
+						// rotX 是纯旋转，保持向量模长，无需 Normalize
 					}
 				}
 			}
@@ -1797,6 +1806,18 @@ Result ConvertFileEmscripten (
 			}
 			std::string fileName = GetFileName (pFile);
 			emscripten::val fileBuffer = loadFunc (fileName);
+
+			emscripten::val Uint8Array = emscripten::val::global("Uint8Array");
+			bool isUint8Array = fileBuffer.instanceof(Uint8Array);
+			if (isUint8Array) {
+				unsigned int length = fileBuffer["length"].as<unsigned int>();
+				Buffer result(length);
+				emscripten::val memory = emscripten::val::module_property("HEAPU8");
+				unsigned int offset = static_cast<unsigned int>(reinterpret_cast<uintptr_t>(result.data()));
+				emscripten::val memoryView = memory.call<emscripten::val>("subarray", offset, offset + length);
+				memoryView.call<void>("set", fileBuffer);
+				return result;
+			}
 			return emscripten::vecFromJSArray<std::uint8_t> (fileBuffer);
 		}
 
@@ -1805,7 +1826,21 @@ Result ConvertFileEmscripten (
 		const emscripten::val& loadFunc;
 	};
 
-	Buffer buffer = emscripten::vecFromJSArray<std::uint8_t> (content);
+	Buffer buffer;
+	{
+		emscripten::val Uint8Array = emscripten::val::global("Uint8Array");
+		bool isUint8Array = content.instanceof(Uint8Array);
+		if (isUint8Array) {
+			unsigned int length = content["length"].as<unsigned int>();
+			buffer.resize(length);
+			emscripten::val memory = emscripten::val::module_property("HEAPU8");
+			unsigned int offset = static_cast<unsigned int>(reinterpret_cast<uintptr_t>(buffer.data()));
+			emscripten::val memoryView = memory.call<emscripten::val>("subarray", offset, offset + length);
+			memoryView.call<void>("set", content);
+		} else {
+			buffer = emscripten::vecFromJSArray<std::uint8_t>(content);
+		}
+	}
 	File file (name, buffer);
 	FileLoaderEmscripten loader (existsFunc, loadFunc);
 	MetadataOptions metadata;
