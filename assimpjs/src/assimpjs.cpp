@@ -52,6 +52,11 @@ static unsigned int GetImportFlagsForFormat (const std::string& format)
 		flags &= ~aiProcess_JoinIdenticalVertices;
 	}
 
+	// FBX and OBJ support polygons natively; skip triangulation to preserve quad faces.
+	if (format == "fbx" || format == "obj") {
+		flags &= ~aiProcess_Triangulate;
+	}
+
 	if (format == "fbx" || format == "obj") {
 		flags |= aiProcess_EmbedTextures;
 	}
@@ -258,7 +263,9 @@ static bool TryCreateMatrix4 (const std::vector<float>& matrix16, aiMatrix4x4& m
 static aiMatrix4x4 ToMatrix (const std::vector<float>& matrix16)
 {
 	aiMatrix4x4 m;
-	TryCreateMatrix4 (matrix16, m);
+	if (!TryCreateMatrix4 (matrix16, m)) {
+		m = aiMatrix4x4 ();
+	}
 	return m;
 }
 
@@ -329,7 +336,13 @@ static std::vector<EmbeddedTextureFile> ExtractEmbeddedTextures (aiScene* scene,
 			size = static_cast<size_t> (tex->mWidth);
 			src = reinterpret_cast<const std::uint8_t*> (tex->pcData);
 		} else {
-			size = static_cast<size_t> (tex->mWidth) * static_cast<size_t> (tex->mHeight) * 4u;
+			constexpr size_t MAX_TEXTURE_SIZE = 1024 * 1024 * 1024;
+			size_t width = static_cast<size_t> (tex->mWidth);
+			size_t height = static_cast<size_t> (tex->mHeight);
+			if (width > MAX_TEXTURE_SIZE / 4 || height > MAX_TEXTURE_SIZE / (width * 4)) {
+				continue;
+			}
+			size = width * height * 4u;
 			src = reinterpret_cast<const std::uint8_t*> (tex->pcData);
 		}
 		if (src == nullptr || size == 0) {
@@ -1305,6 +1318,32 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 		return false;
 	}
 
+	// usdz: always package as USDZ zip (with or without textures).
+	if (format == "usdz") {
+		std::vector<USDZEntry> entries;
+		std::vector<uint8_t> usdaBytes (usdaStr.begin (), usdaStr.end ());
+		std::string baseName = projectName.empty () ? "model" : projectName;
+		entries.push_back ({baseName + ".usda", usdaBytes});
+		for (size_t i = 0; i < renderScene.images.size (); ++i) {
+			const auto& img = renderScene.images[i];
+			if (img.buffer_id < 0 ||
+				static_cast<size_t> (img.buffer_id) >= renderScene.buffers.size ()) {
+				continue;
+			}
+			const auto& buf = renderScene.buffers[static_cast<size_t> (img.buffer_id)];
+			entries.push_back ({img.asset_identifier, buf.data});
+		}
+		std::vector<uint8_t> usdz;
+		if (CreateUSDZ (entries, usdz)) {
+			Buffer content (usdz.begin (), usdz.end ());
+			result.fileList.AddFile (GetFileNameFromFormat ("usdz", projectName), content);
+			result.errorCode = ErrorCode::NoError;
+			return true;
+		}
+		result.errorCode = ErrorCode::ExportError;
+		return false;
+	}
+
 	if (format == "usd" || format == "usdc") {
 		// If there are embedded textures, package USDA + textures as USDZ.
 		// (Skip USDC conversion to avoid data loss in LoadUSDAFromMemory roundtrip)
@@ -1423,7 +1462,33 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		return false;
 	}
 
-	if (format == "usd" || format == "usda" || format == "usdc") {
+	// Scene graph validation (Checkpoint 3)
+	if (scene->mNumMeshes == 0) {
+		std::cerr << "[ExportScene] No meshes in scene" << std::endl;
+		result.errorCode = ErrorCode::ImportError;
+		return false;
+	}
+
+	for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+		const aiMesh* mesh = scene->mMeshes[i];
+		if (mesh == nullptr) {
+			std::cerr << "[ExportScene] Null mesh at index " << i << std::endl;
+			result.errorCode = ErrorCode::ImportError;
+			return false;
+		}
+		if (mesh->mNumVertices == 0) {
+			std::cerr << "[ExportScene] Empty mesh at index " << i << std::endl;
+			result.errorCode = ErrorCode::ImportError;
+			return false;
+		}
+		if (mesh->mNumFaces == 0) {
+			std::cerr << "[ExportScene] No faces in mesh " << i << std::endl;
+			result.errorCode = ErrorCode::ImportError;
+			return false;
+		}
+	}
+
+	if (format == "usd" || format == "usda" || format == "usdc" || format == "usdz") {
 		return ExportSceneUsd (scene, format, result, projectName);
 	}
 
@@ -1486,29 +1551,22 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	}
 
 	if (format == "3mf") {
-		// 3MF 需要 X 轴旋转 90 度 + 单位转换
-		// 3MF导出器使用millimeter单位，GLB是meter单位
-		// GLB的米值会直接变成3MF的毫米值（naive），需要 ×100 缩小 10x
-		// 例如：GLB 0.5m → naive 0.5mm → ×100 → 50mm（相当于真实 500mm 缩小 10x）
+		constexpr float kThreeMfScale = 500.0f;
 		aiMatrix4x4 rotX;
 		aiMatrix4x4::RotationX (AI_MATH_HALF_PI, rotX);
 		aiMatrix4x4 scale;
-		aiMatrix4x4::Scaling (aiVector3D (100.0f, 100.0f, 100.0f), scale);
+		aiMatrix4x4::Scaling (aiVector3D (kThreeMfScale, kThreeMfScale, kThreeMfScale), scale);
 		aiMatrix4x4 transform = scale * rotX;
 
-		// 应用变换到所有mesh的顶点
 		for (unsigned int i = 0; i < mutableScene->mNumMeshes; ++i) {
 			aiMesh* mesh = mutableScene->mMeshes[i];
 			if (mesh != nullptr) {
 				for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
 					mesh->mVertices[v] = transform * mesh->mVertices[v];
 				}
-				// 法线仅需旋转，不需缩放（均匀缩放不改变方向）
-				// 用 rotX 代替 transform，避免 scale×100 后再 Normalize 的 sqrt 开销
 				if (mesh->mNormals != nullptr) {
 					for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
 						mesh->mNormals[v] = rotX * mesh->mNormals[v];
-						// rotX 是纯旋转，保持向量模长，无需 Normalize
 					}
 				}
 			}
@@ -1538,13 +1596,17 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	}
 
 	if (format == "obj") {
-		if (!ReplaceFileListWithZip (result.fileList, "result.zip", result)) {
+		std::string zipName = GetFileNameFromFormat ("obj", projectName);
+		zipName = zipName.substr(0, zipName.find_last_of('.')) + ".zip";
+		if (!ReplaceFileListWithZip (result.fileList, zipName, result)) {
 			result.errorCode = ErrorCode::ExportError;
 			return false;
 		}
 	}
 	if (format == "fbx") {
-		if (!ReplaceFileListWithZip (result.fileList, "result.zip", result)) {
+		std::string zipName = GetFileNameFromFormat ("fbx", projectName);
+		zipName = zipName.substr(0, zipName.find_last_of('.')) + ".zip";
+		if (!ReplaceFileListWithZip (result.fileList, zipName, result)) {
 			result.errorCode = ErrorCode::ExportError;
 			return false;
 		}

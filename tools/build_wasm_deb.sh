@@ -52,7 +52,9 @@ NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 if [[ "$BUILD_TYPE" == "all" ]]; then
     echo "Building all AssimpJS variants..."
-    
+
+    rm -f dist/assimpjs-exporter.* docs/dist/assimpjs-exporter.*
+
     # Build mini version
     echo "Building mini-importers version..."
     emcmake cmake -B build_wasm_mini -G "Unix Makefiles" -DEMSCRIPTEN=1 -DCMAKE_BUILD_TYPE=ReleaseMini . || exit 1
@@ -62,11 +64,6 @@ if [[ "$BUILD_TYPE" == "all" ]]; then
     echo "Building all-importers version..."
     emcmake cmake -B build_wasm_all -G "Unix Makefiles" -DEMSCRIPTEN=1 -DCMAKE_BUILD_TYPE=ReleaseAll . || exit 1
     emmake make -C build_wasm_all -j"$NPROC" AssimpJS || exit 1
-
-    # Build exporter version
-    echo "Building exporter version..."
-    emcmake cmake -B build_wasm_exporter -G "Unix Makefiles" -DEMSCRIPTEN=1 -DCMAKE_BUILD_TYPE=ReleaseExporter . || exit 1
-    emmake make -C build_wasm_exporter -j"$NPROC" AssimpJS || exit 1
 
     # Build meshopt version
     echo "Building meshopt version..."
@@ -81,7 +78,6 @@ if [[ "$BUILD_TYPE" == "all" ]]; then
     mkdir -p dist docs/dist
     cp build_wasm_mini/ReleaseMini/assimpjs-mini.* dist/ 2>/dev/null || true
     cp build_wasm_all/ReleaseAll/assimpjs-all.* dist/ 2>/dev/null || true
-    cp build_wasm_exporter/ReleaseExporter/assimpjs-exporter.* dist/ 2>/dev/null || true
     cp build_wasm_meshopt/ReleaseMeshopt/assimpjs-meshopt.* dist/ 2>/dev/null || true
 else
     # Map build type to build directory

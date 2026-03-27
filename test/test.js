@@ -1,6 +1,7 @@
 const fs = require ('fs');
 const path = require ('path');
 const assert = require ('assert');
+const zlib = require ('zlib');
 
 let config = 'Release'
 if (process.env.TEST_CONFIG !== undefined) {
@@ -168,7 +169,7 @@ function IsExportSuccess (sourceFiles, exportFormat, expectedFilenames)
 		console.log(`Skipping ${exportFormat} export test - exporter build not available`);
 		return false; // Skip test if exporter not available
 	}
-	
+
 	try {
 		// Create fresh FileList for this export operation
 		let fileList = new ajsExporter.FileList ();
@@ -176,41 +177,209 @@ function IsExportSuccess (sourceFiles, exportFormat, expectedFilenames)
 			let filePath = GetTestFileLocation (sourceFiles[i]);
 			fileList.AddFile (filePath, fs.readFileSync (filePath))
 		}
-		
+
 		// Perform export
 		let result = ajsExporter.ConvertFileList (fileList, exportFormat);
-		
+
 		if (!result.IsSuccess ()) {
 			console.log(`Export test failed for ${exportFormat}: Export conversion failed`);
 			return false;
 		}
-		
+
 		// Collect all exported files
 		let allFiles = [];
 		let fileCount = result.FileCount();
-		
+
 		for (let i = 0; i < fileCount; i++) {
 			let file = result.GetFile(i);
 			allFiles.push(file);
 		}
-		
+
 		// Check expected filenames
 		let actualFilenames = allFiles.map(f => f.GetPath()).sort();
 		let expectedSorted = [...expectedFilenames].sort(); // Create a copy and sort
-		
+
 		// Check if arrays match (order independent)
-		if (actualFilenames.length !== expectedSorted.length || 
+		if (actualFilenames.length !== expectedSorted.length ||
 		    !actualFilenames.every((filename, index) => filename === expectedSorted[index])) {
 			console.log(`Export test failed for ${exportFormat}: Expected filenames [${expectedFilenames.join(', ')}], but got [${actualFilenames.join(', ')}]`);
 			return false;
 		}
-		
+
 		return true;
-		
+
 	} catch (error) {
 		console.log(`Export test failed for ${exportFormat}: ${error.message}`);
 		return false;
 	}
+}
+
+function Parse3mfTransform (value)
+{
+	if (!value) {
+		return [
+			1, 0, 0, 0,
+			0, 1, 0, 0,
+			0, 0, 1, 0,
+			0, 0, 0, 1
+		];
+	}
+	let numbers = value.trim ().split (/\s+/).map (Number);
+	assert.equal (numbers.length, 12);
+	return [
+		numbers[0], numbers[3], numbers[6], numbers[9],
+		numbers[1], numbers[4], numbers[7], numbers[10],
+		numbers[2], numbers[5], numbers[8], numbers[11],
+		0, 0, 0, 1
+	];
+}
+
+function ReadZipEntryText (buffer, entryName)
+{
+	const centralDirectorySignature = 0x02014b50;
+	const endOfCentralDirectorySignature = 0x06054b50;
+	for (let offset = buffer.length - 22; offset >= 0; offset--) {
+		if (buffer.readUInt32LE (offset) !== endOfCentralDirectorySignature) {
+			continue;
+		}
+		let centralDirectoryOffset = buffer.readUInt32LE (offset + 16);
+		let entryCount = buffer.readUInt16LE (offset + 10);
+		let entryOffset = centralDirectoryOffset;
+		for (let i = 0; i < entryCount; i++) {
+			if (buffer.readUInt32LE (entryOffset) !== centralDirectorySignature) {
+				return null;
+			}
+			let compressionMethod = buffer.readUInt16LE (entryOffset + 10);
+			let compressedSize = buffer.readUInt32LE (entryOffset + 20);
+			let uncompressedSize = buffer.readUInt32LE (entryOffset + 24);
+			let nameLength = buffer.readUInt16LE (entryOffset + 28);
+			let extraLength = buffer.readUInt16LE (entryOffset + 30);
+			let commentLength = buffer.readUInt16LE (entryOffset + 32);
+			let localHeaderOffset = buffer.readUInt32LE (entryOffset + 42);
+			let fileName = buffer.toString ('utf8', entryOffset + 46, entryOffset + 46 + nameLength);
+			if (fileName === entryName) {
+				let localNameLength = buffer.readUInt16LE (localHeaderOffset + 26);
+				let localExtraLength = buffer.readUInt16LE (localHeaderOffset + 28);
+				let dataStart = localHeaderOffset + 30 + localNameLength + localExtraLength;
+				let payload = buffer.subarray (dataStart, dataStart + compressedSize);
+				if (compressionMethod === 0) {
+					return payload.toString ('utf8');
+				}
+				if (compressionMethod === 8) {
+					return zlib.inflateRawSync (payload).toString ('utf8', 0, uncompressedSize || undefined);
+				}
+				return null;
+			}
+			entryOffset += 46 + nameLength + extraLength + commentLength;
+		}
+	}
+	return null;
+}
+
+// Returns the raw Buffer of a zip entry, or null if not found.
+function ReadZipEntryBinary (buffer, entryName)
+{
+	const centralDirectorySignature = 0x02014b50;
+	const endOfCentralDirectorySignature = 0x06054b50;
+	for (let offset = buffer.length - 22; offset >= 0; offset--) {
+		if (buffer.readUInt32LE (offset) !== endOfCentralDirectorySignature) {
+			continue;
+		}
+		let centralDirectoryOffset = buffer.readUInt32LE (offset + 16);
+		let entryCount = buffer.readUInt16LE (offset + 10);
+		let entryOffset = centralDirectoryOffset;
+		for (let i = 0; i < entryCount; i++) {
+			if (buffer.readUInt32LE (entryOffset) !== centralDirectorySignature) {
+				return null;
+			}
+			let compressionMethod = buffer.readUInt16LE (entryOffset + 10);
+			let compressedSize = buffer.readUInt32LE (entryOffset + 20);
+			let uncompressedSize = buffer.readUInt32LE (entryOffset + 24);
+			let nameLength = buffer.readUInt16LE (entryOffset + 28);
+			let extraLength = buffer.readUInt16LE (entryOffset + 30);
+			let commentLength = buffer.readUInt16LE (entryOffset + 32);
+			let localHeaderOffset = buffer.readUInt32LE (entryOffset + 42);
+			let fileName = buffer.toString ('utf8', entryOffset + 46, entryOffset + 46 + nameLength);
+			if (fileName === entryName) {
+				let localNameLength = buffer.readUInt16LE (localHeaderOffset + 26);
+				let localExtraLength = buffer.readUInt16LE (localHeaderOffset + 28);
+				let dataStart = localHeaderOffset + 30 + localNameLength + localExtraLength;
+				let payload = buffer.subarray (dataStart, dataStart + compressedSize);
+				if (compressionMethod === 0) {
+					return payload;
+				}
+				if (compressionMethod === 8) {
+					return zlib.inflateRawSync (payload).subarray (0, uncompressedSize || undefined);
+				}
+				return null;
+			}
+			entryOffset += 46 + nameLength + extraLength + commentLength;
+		}
+	}
+	return null;
+}
+
+// Returns true if the binary FBX buffer contains at least one quad face.
+// Binary FBX stores polygon indices in PolygonVertexIndex where the last
+// vertex of each face is encoded as -(index + 1) (i.e. negative).
+// A quad has exactly 4 indices per face (3 positive + 1 negative).
+function HasFbxQuadFaces (fbxBuffer)
+{
+	const target = Buffer.from ('PolygonVertexIndex', 'ascii');
+	let pos = fbxBuffer.indexOf (target);
+	while (pos !== -1) {
+		const propPos = pos + target.length;
+		if (propPos + 13 < fbxBuffer.length && fbxBuffer[propPos] === 0x69 /* int32 array */) {
+			const count = fbxBuffer.readUInt32LE (propPos + 1);
+			const encoding = fbxBuffer.readUInt32LE (propPos + 5);
+			if (encoding === 0) {
+				const dataStart = propPos + 13;
+				let faceSize = 0;
+				for (let i = 0; i < count; i++) {
+					faceSize++;
+					if (fbxBuffer.readInt32LE (dataStart + i * 4) < 0) {
+						if (faceSize === 4) {
+							return true;
+						}
+						faceSize = 0;
+					}
+				}
+			}
+		}
+		pos = fbxBuffer.indexOf (target, pos + 1);
+	}
+	return false;
+}
+
+// Returns true if the text OBJ contains at least one quad face line.
+function HasObjQuadFaces (objText)
+{
+	return /(^|\n)f(?:\s+[^\s]+){4}(?=\s|\n|$)/.test (objText);
+}
+
+function Get3mfExtents (buffer)
+{
+	let modelXml = ReadZipEntryText (buffer, '3D/3DModel.model');
+	if (!modelXml) {
+		modelXml = ReadZipEntryText (buffer, '3D/3dmodel.model');
+	}
+	assert (modelXml);
+	let vertices = [...modelXml.matchAll (/<vertex\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)"\s*\/>/g)];
+	assert (vertices.length > 0);
+	let min = [Infinity, Infinity, Infinity];
+	let max = [-Infinity, -Infinity, -Infinity];
+	for (const [, x, y, z] of vertices) {
+		let values = [Number (x), Number (y), Number (z)];
+		for (let i = 0; i < 3; ++i) {
+			min[i] = Math.min (min[i], values[i]);
+			max[i] = Math.max (max[i], values[i]);
+		}
+	}
+	return {
+		x : max[0] - min[0],
+		y : max[1] - min[1],
+		z : max[2] - min[2]
+	};
 }
 
 
@@ -875,6 +1044,47 @@ it ('FBX Export', function () {
 	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'fbx', ['result.zip']));
 });
 
+it ('FBX Export preserves quad faces from FBX input', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+		return;
+	}
+	const filePath = GetTestFileLocation ('FBX/phong_cube.fbx');
+	if (!fs.existsSync (filePath)) {
+		this.skip ();
+		return;
+	}
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let result = ajsMeshopt.ConvertFileList (fileList, 'fbx');
+	assert (result.IsSuccess (), 'FBX->FBX conversion should succeed');
+	assert.equal (result.FileCount (), 1);
+	const zipBuf = Buffer.from (result.GetFile (0).GetContent ());
+	const fbxBuf = ReadZipEntryBinary (zipBuf, 'result.fbx');
+	assert (fbxBuf !== null, 'result.fbx not found in output zip');
+	assert (HasFbxQuadFaces (fbxBuf), 'FBX output should contain quad faces (not triangulated)');
+});
+
+it ('OBJ Export preserves quad faces from FBX input', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+		return;
+	}
+	const filePath = GetTestFileLocation ('FBX/phong_cube.fbx');
+	if (!fs.existsSync (filePath)) {
+		this.skip ();
+		return;
+	}
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let result = ajsMeshopt.ConvertFileList (fileList, 'obj');
+	assert (result.IsSuccess (), 'FBX->OBJ conversion should succeed');
+	const zipBuf = Buffer.from (result.GetFile (0).GetContent ());
+	const objText = ReadZipEntryText (zipBuf, 'result.obj');
+	assert (objText !== null, 'result.obj not found in output zip');
+	assert (HasObjQuadFaces (objText), 'OBJ output should contain quad faces (not triangulated)');
+});
+
 it ('DAE Export', function () {
 	assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], 'dae', ['result.dae', 'result.dae/result_texture_0001.png']));
 	assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], 'dae', ['result.dae']));
@@ -899,12 +1109,50 @@ it ('X3D Export', function () {
 	assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], 'x3d', ['result.x3d']));
 });
 
+it ('3MF Export keeps per-part transforms in meshopt build', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+		return;
+	}
+	const filePath = GetTestFileLocation ('glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let exportResult = ajsMeshopt.ConvertFileList (fileList, '3mf', undefined, 'meshopt-transform-test');
+	assert (exportResult.IsSuccess ());
+	assert.equal (exportResult.FileCount (), 1);
+	let modelXml = ReadZipEntryText (Buffer.from (exportResult.GetFile (0).GetContent ()), '3D/3DModel.model');
+	if (!modelXml) {
+		modelXml = ReadZipEntryText (Buffer.from (exportResult.GetFile (0).GetContent ()), '3D/3dmodel.model');
+	}
+	assert (modelXml);
+	let itemTransforms = [...modelXml.matchAll (/<item[^>]*transform="([^"]+)"/g)].map ((match) => Parse3mfTransform (match[1]));
+	assert (itemTransforms.length > 1);
+	let uniqueTransforms = new Set (itemTransforms.map ((transform) => transform.join (',')));
+	assert (uniqueTransforms.size > 1);
+});
+
 it ('3MF Export', function () {
   assert (IsExportSuccess (['glTF2/BoxTextured-glTF-Binary/BoxTextured.glb'], '3mf', ['result.3mf']));
   assert (IsExportSuccess (['glTF2/simple_skin/quad_skin.glb'], '3mf', ['result.3mf']));
   assert (IsExportSuccess (['glTF2/2CylinderEngine-glTF-Binary/2CylinderEngine.glb'], '3mf', ['result.3mf']));
   assert (IsExportSuccess (['glTF2/BoxBadNormals-glTF-Binary/BoxBadNormals.glb'], '3mf', ['result.3mf']));
   assert (IsExportSuccess (['glTF2/BoxWithInfinites-glTF-Binary/BoxWithInfinites.glb'], '3mf', ['result.3mf']));
+});
+
+it ('3MF Export uses 5x larger runtime scale in meshopt build', function () {
+	if (!ajsMeshopt) {
+		this.skip ();
+		return;
+	}
+	const filePath = GetTestFileLocation ('glTF2/BoxTextured-glTF-Binary/BoxTextured.glb');
+	let fileList = new ajsMeshopt.FileList ();
+	fileList.AddFile (filePath, fs.readFileSync (filePath));
+	let exportResult = ajsMeshopt.ConvertFileList (fileList, '3mf');
+	assert (exportResult.IsSuccess ());
+	let extents = Get3mfExtents (Buffer.from (exportResult.GetFile (0).GetContent ()));
+	assert.ok (Math.abs (extents.x - 500.0) < 0.01, `Unexpected 3MF width: ${extents.x}`);
+	assert.ok (Math.abs (extents.y - 500.0) < 0.01, `Unexpected 3MF height: ${extents.y}`);
+	assert.ok (Math.abs (extents.z - 500.0) < 0.01, `Unexpected 3MF depth: ${extents.z}`);
 });
 
 it ('3DS Export', function () {
