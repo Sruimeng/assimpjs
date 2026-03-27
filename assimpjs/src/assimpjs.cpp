@@ -1455,7 +1455,137 @@ static void CollectMaterialParts (const aiScene* scene, TextureNamingContext& ct
 	ctx.partNameByMaterial = std::move (first);
 }
 
-static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
+// ── Vertex Welding ────────────────────────────────────────────────────────────
+// Merge vertices that share the same position (ignoring normals/UVs).
+// Normals are discarded here; call RebuildSmoothNormals afterwards.
+
+struct WeldKey {
+	int32_t x, y, z;
+	bool operator== (const WeldKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct WeldKeyHash {
+	std::size_t operator() (const WeldKey& k) const {
+		std::size_t h = 2166136261u;
+		h = (h ^ static_cast<uint32_t> (k.x)) * 16777619u;
+		h = (h ^ static_cast<uint32_t> (k.y)) * 16777619u;
+		h = (h ^ static_cast<uint32_t> (k.z)) * 16777619u;
+		return h;
+	}
+};
+
+static void WeldMeshByPosition (aiMesh* mesh, float epsilon)
+{
+	if (!mesh || mesh->mNumVertices < 2 || mesh->mNumFaces == 0) return;
+
+	const float invEps = 1.0f / epsilon;
+	std::unordered_map<WeldKey, unsigned int, WeldKeyHash> posMap;
+	posMap.reserve (mesh->mNumVertices);
+
+	std::vector<unsigned int> remap (mesh->mNumVertices);
+	std::vector<unsigned int> canonical;
+	canonical.reserve (mesh->mNumVertices);
+
+	for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+		const aiVector3D& v = mesh->mVertices[i];
+		WeldKey key {
+			static_cast<int32_t> (std::floor (v.x * invEps + 0.5f)),
+			static_cast<int32_t> (std::floor (v.y * invEps + 0.5f)),
+			static_cast<int32_t> (std::floor (v.z * invEps + 0.5f))
+		};
+		auto ins = posMap.emplace (key, static_cast<unsigned int> (canonical.size ()));
+		if (ins.second) {
+			remap[i] = static_cast<unsigned int> (canonical.size ());
+			canonical.push_back (i);
+		} else {
+			remap[i] = ins.first->second;
+		}
+	}
+
+	const unsigned int newCount = static_cast<unsigned int> (canonical.size ());
+	if (newCount == mesh->mNumVertices) return;
+
+	// Compact positions
+	auto* newVerts = new aiVector3D[newCount];
+	for (unsigned int i = 0; i < newCount; ++i)
+		newVerts[i] = mesh->mVertices[canonical[i]];
+	delete[] mesh->mVertices;
+	mesh->mVertices = newVerts;
+
+	// Normals/tangents will be rebuilt — drop them now
+	delete[] mesh->mNormals;    mesh->mNormals    = nullptr;
+	delete[] mesh->mTangents;   mesh->mTangents   = nullptr;
+	delete[] mesh->mBitangents; mesh->mBitangents = nullptr;
+
+	// Compact UV channels (take canonical vertex's UV)
+	for (unsigned int ch = 0; ch < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++ch) {
+		if (!mesh->mTextureCoords[ch]) continue;
+		auto* newUV = new aiVector3D[newCount];
+		for (unsigned int i = 0; i < newCount; ++i)
+			newUV[i] = mesh->mTextureCoords[ch][canonical[i]];
+		delete[] mesh->mTextureCoords[ch];
+		mesh->mTextureCoords[ch] = newUV;
+	}
+
+	// Compact color channels
+	for (unsigned int ch = 0; ch < AI_MAX_NUMBER_OF_COLOR_SETS; ++ch) {
+		if (!mesh->mColors[ch]) continue;
+		auto* newCol = new aiColor4D[newCount];
+		for (unsigned int i = 0; i < newCount; ++i)
+			newCol[i] = mesh->mColors[ch][canonical[i]];
+		delete[] mesh->mColors[ch];
+		mesh->mColors[ch] = newCol;
+	}
+
+	// Remap face indices
+	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+		aiFace& face = mesh->mFaces[f];
+		for (unsigned int k = 0; k < face.mNumIndices; ++k)
+			face.mIndices[k] = remap[face.mIndices[k]];
+	}
+
+	mesh->mNumVertices = newCount;
+}
+
+// ── Normal Reconstruction ─────────────────────────────────────────────────────
+// Area-weighted smooth normals. Suitable for organic models.
+// For hard-surface with sharp edges, vertices at creases get averaged normals.
+
+static void RebuildSmoothNormals (aiMesh* mesh)
+{
+	if (!mesh || mesh->mNumVertices == 0 || mesh->mNumFaces == 0) return;
+
+	delete[] mesh->mNormals;
+	mesh->mNormals = new aiVector3D[mesh->mNumVertices];
+	for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
+		mesh->mNormals[i] = aiVector3D (0.0f, 0.0f, 0.0f);
+
+	// Accumulate area-weighted face normals (cross product magnitude = 2*area)
+	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+		const aiFace& face = mesh->mFaces[f];
+		if (face.mNumIndices < 3) continue;
+		const aiVector3D& v0 = mesh->mVertices[face.mIndices[0]];
+		const aiVector3D& v1 = mesh->mVertices[face.mIndices[1]];
+		const aiVector3D& v2 = mesh->mVertices[face.mIndices[2]];
+		aiVector3D fn = (v1 - v0) ^ (v2 - v0);
+		for (unsigned int k = 0; k < face.mNumIndices; ++k)
+			mesh->mNormals[face.mIndices[k]] += fn;
+	}
+
+	for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
+		mesh->mNormals[i].Normalize ();
+}
+
+static std::string GetExtFromPath (const std::string& path)
+{
+	auto pos = path.rfind ('.');
+	if (pos == std::string::npos) return "";
+	std::string ext = path.substr (pos + 1);
+	for (auto& c : ext) c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
+	return ext;
+}
+
+static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const std::string& inputFormat = "")
 {
 	if (scene == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -1570,6 +1700,19 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 					}
 				}
 			}
+		}
+	}
+
+	// Weld duplicate positions and rebuild smooth normals for formats that store
+	// normals per-face-vertex (OBJ/FBX). Only applied when input is GLB/GLTF,
+	// which expands vertices (no JoinIdenticalVertices at import). For other
+	// inputs (FBX, OBJ, ...) normals may be carefully authored — leave them.
+	const bool inputIsGltf = (inputFormat == "glb" || inputFormat == "glb2" ||
+	                          inputFormat == "gltf" || inputFormat == "gltf2");
+	if (inputIsGltf && (format == "obj" || format == "fbx")) {
+		for (unsigned int i = 0; i < mutableScene->mNumMeshes; ++i) {
+			WeldMeshByPosition (mutableScene->mMeshes[i], 1e-5f);
+			RebuildSmoothNormals (mutableScene->mMeshes[i]);
 		}
 	}
 
@@ -1732,7 +1875,7 @@ Result ConvertFile (const File& file, const std::string& format, const FileLoade
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, GetExtFromPath (file.path));
 	return result;
 }
 
@@ -1747,10 +1890,12 @@ Result ConvertFileList (const FileList& fileList, const std::string& format, con
 	const unsigned int flags = GetImportFlagsForFormat (format);
 
 	const aiScene* scene = nullptr;
+	std::string inputPath;
 	for (size_t fileIndex = 0; fileIndex < fileList.FileCount (); fileIndex++) {
 		const File& file = fileList.GetFile (fileIndex);
 		scene = ImportFileListByMainFile (importer, file, flags);
 		if (scene != nullptr) {
+			inputPath = file.path;
 			break;
 		}
 	}
@@ -1759,7 +1904,7 @@ Result ConvertFileList (const FileList& fileList, const std::string& format, con
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, GetExtFromPath (inputPath));
 	return result;
 }
 
@@ -1779,10 +1924,12 @@ Result ConvertFileListWithTransform (const FileList& fileList, const std::string
 	const unsigned int flags = GetImportFlagsForFormat (format);
 
 	const aiScene* scene = nullptr;
+	std::string inputPath;
 	for (size_t fileIndex = 0; fileIndex < fileList.FileCount (); fileIndex++) {
 		const File& file = fileList.GetFile (fileIndex);
 		scene = ImportFileListByMainFile (importer, file, flags);
 		if (scene != nullptr) {
+			inputPath = file.path;
 			break;
 		}
 	}
@@ -1794,7 +1941,7 @@ Result ConvertFileListWithTransform (const FileList& fileList, const std::string
 	}
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, GetExtFromPath (inputPath));
 	return result;
 }
 
@@ -1809,10 +1956,12 @@ Result ConvertFileListWithNodeTransforms (const FileList& fileList, const std::s
 	const unsigned int flags = GetImportFlagsForFormat (format);
 
 	const aiScene* scene = nullptr;
+	std::string inputPath;
 	for (size_t fileIndex = 0; fileIndex < fileList.FileCount (); fileIndex++) {
 		const File& file = fileList.GetFile (fileIndex);
 		scene = ImportFileListByMainFile (importer, file, flags);
 		if (scene != nullptr) {
+			inputPath = file.path;
 			break;
 		}
 	}
@@ -1825,7 +1974,7 @@ Result ConvertFileListWithNodeTransforms (const FileList& fileList, const std::s
 	ApplyTransformsToNodesByName (scene->mRootNode, transformByName);
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, GetExtFromPath (inputPath));
 	return result;
 }
 
