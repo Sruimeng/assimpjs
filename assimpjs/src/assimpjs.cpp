@@ -807,7 +807,7 @@ static void WriteUsdNode (std::ostringstream& ss, const aiScene* scene, const ai
 	ss << "}\n";
 }
 
-static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
+static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -823,6 +823,9 @@ static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& for
 	ss << std::setprecision (8);
 	ss << "#usda 1.0\n";
 	ss << "(\n";
+	if (metadata != nullptr && !metadata->taskId.empty ()) {
+		ss << "    documentation = \"Beijing VAST-" << metadata->taskId << "-AIGC Content\"\n";
+	}
 	ss << "    upAxis = \"Y\"\n";
 	ss << ")\n";
 	ss << "def Xform \"Scene\" {\n";
@@ -1061,7 +1064,7 @@ static void CollectMeshInstances (const aiScene* scene, const aiNode* node, cons
 	}
 }
 
-static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err, const std::string& projectName)
+static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err, const std::string& projectName, const MetadataOptions* metadata = nullptr)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		err = "scene is null";
@@ -1076,6 +1079,9 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 	}
 
 	out.meta.upAxis = "Y";
+	if (metadata != nullptr && !metadata->taskId.empty ()) {
+		out.meta.comment = "Beijing VAST-" + metadata->taskId + "-AIGC Content";
+	}
 
 	// ── Build materials ──────────────────────────────────────────────────────
 	std::unordered_map<std::string, int32_t> texCache; // aiTex path → texture_id
@@ -1299,12 +1305,12 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 
 #endif
 
-static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
+static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
 {
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
 	tinyusdz::tydra::RenderScene renderScene;
 	std::string err;
-	if (!BuildTinyUsdScene (scene, renderScene, err, projectName)) {
+	if (!BuildTinyUsdScene (scene, renderScene, err, projectName, metadata)) {
 		result.errorCode = ErrorCode::ExportError;
 		return false;
 	}
@@ -1312,7 +1318,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	std::string usdaStr;
 	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
 		if (format == "usda") {
-			return ExportSceneUsdFallback (scene, format, result, projectName);
+			return ExportSceneUsdFallback (scene, format, result, projectName, metadata);
 		}
 		result.errorCode = ErrorCode::ExportError;
 		return false;
@@ -1420,7 +1426,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	result.errorCode = ErrorCode::NoError;
 	return true;
 #else
-	return ExportSceneUsdFallback (scene, format, result, projectName);
+	return ExportSceneUsdFallback (scene, format, result, projectName, metadata);
 #endif
 }
 
@@ -1455,7 +1461,7 @@ static void CollectMaterialParts (const aiScene* scene, TextureNamingContext& ct
 	ctx.partNameByMaterial = std::move (first);
 }
 
-static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName)
+static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
 {
 	if (scene == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -1489,12 +1495,16 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	}
 
 	if (format == "usd" || format == "usda" || format == "usdc" || format == "usdz") {
-		return ExportSceneUsd (scene, format, result, projectName);
+		return ExportSceneUsd (scene, format, result, projectName, metadata);
 	}
 
 	const bool isGltfOutput =
 		format == "gltf" || format == "gltf2" ||
 		format == "glb" || format == "glb2";
+	const bool isFbxOutput = format == "fbx";
+	const bool isObjOutput = format == "obj";
+	const bool isStlOutput = format == "stl";
+	const bool isThreeMfOutput = format == "3mf";
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	const unsigned int originalFlags = mutableScene->mFlags;
 	if (isGltfOutput) {
@@ -1569,6 +1579,35 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 						mesh->mNormals[v] = rotX * mesh->mNormals[v];
 					}
 				}
+			}
+		}
+	}
+
+	// Inject custom metadata into scene metadata for exporters that read aiScene metadata
+	if (metadata != nullptr && !metadata->taskId.empty ()) {
+		std::string generator = "Beijing VAST-" + metadata->taskId + "-AIGC Content";
+		if (isGltfOutput) {
+			if (mutableScene->mMetaData == nullptr) {
+				mutableScene->mMetaData = aiMetadata::Alloc (1);
+				mutableScene->mMetaData->Set (0, "custom_generator", aiString (generator));
+			} else {
+				mutableScene->mMetaData->Add ("custom_generator", aiString (generator));
+			}
+		}
+		if (isFbxOutput || isObjOutput || isStlOutput) {
+			if (mutableScene->mMetaData == nullptr) {
+				mutableScene->mMetaData = aiMetadata::Alloc (1);
+				mutableScene->mMetaData->Set (0, "Creator", aiString (generator));
+			} else {
+				mutableScene->mMetaData->Add ("Creator", aiString (generator));
+			}
+		}
+		if (isThreeMfOutput) {
+			if (mutableScene->mMetaData == nullptr) {
+				mutableScene->mMetaData = aiMetadata::Alloc (1);
+				mutableScene->mMetaData->Set (0, "Application", aiString (generator));
+			} else {
+				mutableScene->mMetaData->Add ("Application", aiString (generator));
 			}
 		}
 	}
@@ -1732,7 +1771,7 @@ Result ConvertFile (const File& file, const std::string& format, const FileLoade
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, metadata);
 	return result;
 }
 
@@ -1759,7 +1798,7 @@ Result ConvertFileList (const FileList& fileList, const std::string& format, con
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, metadata);
 	return result;
 }
 
@@ -1794,7 +1833,7 @@ Result ConvertFileListWithTransform (const FileList& fileList, const std::string
 	}
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, metadata);
 	return result;
 }
 
@@ -1825,7 +1864,7 @@ Result ConvertFileListWithNodeTransforms (const FileList& fileList, const std::s
 	ApplyTransformsToNodesByName (scene->mRootNode, transformByName);
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName);
+	ExportScene (mutableScene, format, result, projectName, metadata);
 	return result;
 }
 
@@ -2110,6 +2149,11 @@ static bool TryReadMetadata (const emscripten::val& input, MetadataOptions& meta
 			meta.hasMaterialFactors = true;
 			meta.metallic = m;
 			meta.roughness = r;
+			any = true;
+		}
+	}
+	if (input.hasOwnProperty ("task_id")) {
+		if (TryReadString (input["task_id"], meta.taskId)) {
 			any = true;
 		}
 	}

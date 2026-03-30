@@ -33,6 +33,9 @@ struct MetadataOptions
 	bool hasMaterialFactors = false;
 	float metallic = 0.0f;
 	float roughness = 0.5f;
+
+	// Optional custom generator branding driven by task id
+	std::string taskId;
 };
 
 using NodeTransformMap = std::unordered_map<std::string, aiMatrix4x4>;
