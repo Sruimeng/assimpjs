@@ -47,6 +47,7 @@ tools/emsdk/
 node_modules/
 build
 temp
+.claude
 build_wasm_all
 build_wasm_exporter
 build_wasm_meshopt
