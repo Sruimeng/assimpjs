@@ -2,21 +2,27 @@
 
 #include <assimp/Importer.hpp>
 #include <assimp/Exporter.hpp>
+#include <assimp/config.h>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include <assimp/matrix3x3.h>
 #include <assimp/material.h>
 
 #include <stdio.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "../../assimp/contrib/meshoptimizer/meshoptimizer.h"
 
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
 #include "tydra/render-data.hh"
@@ -252,6 +258,206 @@ static std::string GetFileNameFromFormat (const std::string& format, const std::
 	return fileName;
 }
 
+static void ReleaseMeshTextureCoordNames (aiMesh* mesh)
+{
+	if (mesh == nullptr || mesh->mTextureCoordsNames == nullptr) {
+		return;
+	}
+	for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+		delete mesh->mTextureCoordsNames[i];
+		mesh->mTextureCoordsNames[i] = nullptr;
+	}
+	delete[] mesh->mTextureCoordsNames;
+	mesh->mTextureCoordsNames = nullptr;
+}
+
+static void ReleaseMeshBones (aiMesh* mesh)
+{
+	if (mesh == nullptr || mesh->mNumBones == 0 || mesh->mBones == nullptr) {
+		return;
+	}
+	std::unordered_set<const aiBone*> bones;
+	for (unsigned int i = 0; i < mesh->mNumBones; ++i) {
+		if (mesh->mBones[i] != nullptr) {
+			bones.insert (mesh->mBones[i]);
+		}
+	}
+	for (const aiBone* bone : bones) {
+		delete bone;
+	}
+	delete[] mesh->mBones;
+	mesh->mBones = nullptr;
+	mesh->mNumBones = 0;
+}
+
+static void ReleaseMeshAnimMeshes (aiMesh* mesh)
+{
+	if (mesh == nullptr || mesh->mNumAnimMeshes == 0 || mesh->mAnimMeshes == nullptr) {
+		return;
+	}
+	for (unsigned int i = 0; i < mesh->mNumAnimMeshes; ++i) {
+		delete mesh->mAnimMeshes[i];
+	}
+	delete[] mesh->mAnimMeshes;
+	mesh->mAnimMeshes = nullptr;
+	mesh->mNumAnimMeshes = 0;
+}
+
+static bool SimplifyMeshForStl (aiMesh* mesh, float targetRatio, float targetError)
+{
+	if (mesh == nullptr || mesh->mVertices == nullptr || mesh->mFaces == nullptr) {
+		return false;
+	}
+	if (mesh->mNumVertices < 3 || mesh->mNumFaces < 2) {
+		return false;
+	}
+
+	std::vector<unsigned int> indices;
+	indices.reserve (static_cast<size_t> (mesh->mNumFaces) * 3);
+	for (unsigned int faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex) {
+		const aiFace& face = mesh->mFaces[faceIndex];
+		if (face.mNumIndices != 3 || face.mIndices == nullptr) {
+			return false;
+		}
+		for (unsigned int i = 0; i < 3; ++i) {
+			if (face.mIndices[i] >= mesh->mNumVertices) {
+				return false;
+			}
+			indices.push_back (face.mIndices[i]);
+		}
+	}
+
+	if (indices.size () < 6) {
+		return false;
+	}
+
+	size_t targetIndexCount = static_cast<size_t> (indices.size () * targetRatio);
+	targetIndexCount -= targetIndexCount % 3;
+	targetIndexCount = std::max<size_t> (3, targetIndexCount);
+	if (targetIndexCount >= indices.size ()) {
+		return false;
+	}
+
+	std::vector<unsigned int> simplifiedIndices (indices.size ());
+	size_t simplifiedIndexCount = meshopt_simplify (
+		simplifiedIndices.data (),
+		indices.data (),
+		indices.size (),
+		&(mesh->mVertices[0].x),
+		mesh->mNumVertices,
+		sizeof (aiVector3D),
+		targetIndexCount,
+		targetError,
+		meshopt_SimplifyLockBorder,
+		nullptr
+	);
+	if (simplifiedIndexCount >= indices.size ()) {
+		simplifiedIndexCount = meshopt_simplifySloppy (
+			simplifiedIndices.data (),
+			indices.data (),
+			indices.size (),
+			&(mesh->mVertices[0].x),
+			mesh->mNumVertices,
+			sizeof (aiVector3D),
+			targetIndexCount,
+			targetError,
+			nullptr
+		);
+	}
+	if (simplifiedIndexCount < 3 || simplifiedIndexCount >= indices.size ()) {
+		return false;
+	}
+
+	simplifiedIndices.resize (simplifiedIndexCount);
+	std::vector<aiVector3D> simplifiedVertices (mesh->mNumVertices);
+	const size_t simplifiedVertexCount = meshopt_optimizeVertexFetch (
+		simplifiedVertices.data (),
+		simplifiedIndices.data (),
+		simplifiedIndices.size (),
+		mesh->mVertices,
+		mesh->mNumVertices,
+		sizeof (aiVector3D)
+	);
+	if (simplifiedVertexCount < 3) {
+		return false;
+	}
+	simplifiedVertices.resize (simplifiedVertexCount);
+
+	aiVector3D* newVertices = new aiVector3D[simplifiedVertexCount];
+	for (size_t i = 0; i < simplifiedVertexCount; ++i) {
+		newVertices[i] = simplifiedVertices[i];
+	}
+
+	const unsigned int newFaceCount = static_cast<unsigned int> (simplifiedIndices.size () / 3);
+	aiFace* newFaces = new aiFace[newFaceCount];
+	for (unsigned int faceIndex = 0; faceIndex < newFaceCount; ++faceIndex) {
+		aiFace& face = newFaces[faceIndex];
+		face.mNumIndices = 3;
+		face.mIndices = new unsigned int[3];
+		face.mIndices[0] = simplifiedIndices[faceIndex * 3 + 0];
+		face.mIndices[1] = simplifiedIndices[faceIndex * 3 + 1];
+		face.mIndices[2] = simplifiedIndices[faceIndex * 3 + 2];
+	}
+
+	delete[] mesh->mVertices;
+	mesh->mVertices = newVertices;
+	delete[] mesh->mNormals;
+	mesh->mNormals = nullptr;
+	delete[] mesh->mTangents;
+	mesh->mTangents = nullptr;
+	delete[] mesh->mBitangents;
+	mesh->mBitangents = nullptr;
+	for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_COLOR_SETS; ++i) {
+		delete[] mesh->mColors[i];
+		mesh->mColors[i] = nullptr;
+	}
+	for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
+		delete[] mesh->mTextureCoords[i];
+		mesh->mTextureCoords[i] = nullptr;
+		mesh->mNumUVComponents[i] = 0;
+	}
+	ReleaseMeshTextureCoordNames (mesh);
+	ReleaseMeshBones (mesh);
+	ReleaseMeshAnimMeshes (mesh);
+	delete[] mesh->mFaces;
+	mesh->mFaces = newFaces;
+	mesh->mPrimitiveTypes = aiPrimitiveType_TRIANGLE;
+	mesh->mNumVertices = static_cast<unsigned int> (simplifiedVertexCount);
+	mesh->mNumFaces = newFaceCount;
+
+	aiVector3D minVertex = mesh->mVertices[0];
+	aiVector3D maxVertex = mesh->mVertices[0];
+	for (unsigned int i = 1; i < mesh->mNumVertices; ++i) {
+		const aiVector3D& vertex = mesh->mVertices[i];
+		minVertex.x = std::min (minVertex.x, vertex.x);
+		minVertex.y = std::min (minVertex.y, vertex.y);
+		minVertex.z = std::min (minVertex.z, vertex.z);
+		maxVertex.x = std::max (maxVertex.x, vertex.x);
+		maxVertex.y = std::max (maxVertex.y, vertex.y);
+		maxVertex.z = std::max (maxVertex.z, vertex.z);
+	}
+	mesh->mAABB.mMin = minVertex;
+	mesh->mAABB.mMax = maxVertex;
+	return true;
+}
+
+static bool SimplifySceneForStl (aiScene* scene)
+{
+	if (scene == nullptr || scene->mNumMeshes == 0 || scene->mMeshes == nullptr) {
+		return false;
+	}
+
+	constexpr float kTargetRatio = 0.5f;
+	constexpr float kTargetError = 1.0f;
+	bool simplified = false;
+	for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
+		if (SimplifyMeshForStl (scene->mMeshes[i], kTargetRatio, kTargetError)) {
+			simplified = true;
+		}
+	}
+	return simplified;
+}
+
 struct EmbeddedTextureFile
 {
 	std::string path;
@@ -394,10 +600,17 @@ static aiString MakeTextureName (const std::string& name)
 struct TextureNamingContext
 {
 	std::string project;
+	std::string folderPrefix;
 	bool multiPart = false;
 	std::unordered_map<unsigned int, std::string> partNameByMaterial; // material index -> part name
 	std::unordered_map<const aiTexture*, std::string> embeddedOriginal;
 	std::unordered_map<const aiTexture*, std::string> embeddedNew;
+};
+
+struct RenamedTextureFile
+{
+	std::string sourcePath;
+	std::string outputPath;
 };
 
 static std::string ToPartName (const std::string& raw)
@@ -422,10 +635,23 @@ static std::string ComposeTexBase (const TextureNamingContext& ctx, const std::s
 	return ctx.project;
 }
 
+static std::string ApplyTextureFolderPrefix (const TextureNamingContext& ctx, const std::string& fileName)
+{
+	if (ctx.folderPrefix.empty ()) {
+		return fileName;
+	}
+	std::string prefix = ctx.folderPrefix;
+	if (prefix.back () != '/') {
+		prefix.push_back ('/');
+	}
+	return prefix + fileName;
+}
+
 static void RenameMaterialTextures (
 	aiScene* scene,
 	TextureNamingContext& naming,
-	std::vector<EmbeddedTextureFile>& embeddedFiles)
+	std::vector<EmbeddedTextureFile>& embeddedFiles,
+	std::vector<RenamedTextureFile>* renamedExternalFiles = nullptr)
 {
 	if (scene == nullptr) {
 		return;
@@ -467,6 +693,7 @@ static void RenameMaterialTextures (
 				if (!ext.empty ()) {
 					newName += ext;
 				}
+				std::string outputPath = ApplyTextureFolderPrefix (naming, newName);
 				// Find embedded texture by matching path in embeddedOriginal map
 				const aiTexture* embPtr = nullptr;
 				for (const auto& kv : naming.embeddedOriginal) {
@@ -483,9 +710,20 @@ static void RenameMaterialTextures (
 					}
 				}
 				if (embPtr != nullptr) {
-					naming.embeddedNew[embPtr] = newName;
+					naming.embeddedNew[embPtr] = outputPath;
+				} else if (renamedExternalFiles != nullptr && pathStr != outputPath) {
+					bool found = false;
+					for (const RenamedTextureFile& item : *renamedExternalFiles) {
+						if (item.sourcePath == pathStr && item.outputPath == outputPath) {
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						renamedExternalFiles->push_back ({ pathStr, outputPath });
+					}
 				}
-				aiString newPath = MakeTextureName (newName);
+				aiString newPath = MakeTextureName (outputPath);
 				mat->AddProperty (&newPath, AI_MATKEY_TEXTURE (t, ti));
 			}
 		};
@@ -509,6 +747,25 @@ static void RenameMaterialTextures (
 			}
 		}
 	}
+}
+
+static const File* FindTextureSourceFile (const FileList& fileList, const std::string& texturePath)
+{
+	const File* exact = fileList.GetFile (texturePath);
+	if (exact != nullptr) {
+		return exact;
+	}
+	const std::string textureName = GetFileName (texturePath);
+	if (textureName.empty ()) {
+		return nullptr;
+	}
+	for (size_t i = 0; i < fileList.FileCount (); ++i) {
+		const File& file = fileList.GetFile (i);
+		if (GetFileName (file.path) == textureName) {
+			return &file;
+		}
+	}
+	return nullptr;
 }
 
 static void UpdateEmbeddedTextureFilenames (aiScene* scene, const TextureNamingContext& naming)
@@ -652,8 +909,380 @@ static bool IsIdentityMatrix (const aiMatrix4x4& m)
 	return std::fabs (m.a1 - 1.0f) < eps && std::fabs (m.b2 - 1.0f) < eps && std::fabs (m.c3 - 1.0f) < eps && std::fabs (m.d4 - 1.0f) < eps &&
 		std::fabs (m.a2) < eps && std::fabs (m.a3) < eps && std::fabs (m.a4) < eps &&
 		std::fabs (m.b1) < eps && std::fabs (m.b3) < eps && std::fabs (m.b4) < eps &&
-		std::fabs (m.c1) < eps && std::fabs (m.c2) < eps && std::fabs (m.c4) < eps &&
-		std::fabs (m.d1) < eps && std::fabs (m.d2) < eps && std::fabs (m.d3) < eps;
+			std::fabs (m.c1) < eps && std::fabs (m.c2) < eps && std::fabs (m.c4) < eps &&
+			std::fabs (m.d1) < eps && std::fabs (m.d2) < eps && std::fabs (m.d3) < eps;
+}
+
+struct ObjMeshInstance
+{
+	const aiMesh* mesh;
+	aiMatrix4x4 transform;
+	std::string name;
+};
+
+static void CollectObjMeshInstances (const aiScene* scene, const aiNode* node, const aiMatrix4x4& parent, std::vector<ObjMeshInstance>& out)
+{
+	if (scene == nullptr || node == nullptr) {
+		return;
+	}
+	aiMatrix4x4 current = parent * node->mTransformation;
+	for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+		unsigned int meshIndex = node->mMeshes[i];
+		if (meshIndex >= scene->mNumMeshes) {
+			continue;
+		}
+		const aiMesh* mesh = scene->mMeshes[meshIndex];
+		std::string name = node->mName.C_Str ();
+		if (name.empty () && mesh != nullptr) {
+			name = mesh->mName.C_Str ();
+		}
+		out.push_back ({ mesh, current, name });
+	}
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		CollectObjMeshInstances (scene, node->mChildren[i], current, out);
+	}
+}
+
+struct ObjVec3Key
+{
+	uint32_t x;
+	uint32_t y;
+	uint32_t z;
+
+	bool operator== (const ObjVec3Key& o) const
+	{
+		return x == o.x && y == o.y && z == o.z;
+	}
+};
+
+struct ObjVec2Key
+{
+	uint32_t x;
+	uint32_t y;
+
+	bool operator== (const ObjVec2Key& o) const
+	{
+		return x == o.x && y == o.y;
+	}
+};
+
+struct ObjKeyHash
+{
+	template <typename T>
+	std::size_t operator() (const T& k) const
+	{
+		std::size_t h = static_cast<std::size_t> (2166136261u);
+		const uint32_t* words = reinterpret_cast<const uint32_t*> (&k);
+		for (size_t i = 0; i < sizeof (T) / sizeof (uint32_t); ++i) {
+			h ^= static_cast<std::size_t> (words[i]);
+			h *= static_cast<std::size_t> (16777619u);
+		}
+		return h;
+	}
+};
+
+static uint32_t FloatBits (float value)
+{
+	uint32_t bits = 0;
+	std::memcpy (&bits, &value, sizeof (bits));
+	return bits;
+}
+
+static ObjVec3Key MakeObjVec3Key (const aiVector3D& value)
+{
+	return { FloatBits (value.x), FloatBits (value.y), FloatBits (value.z) };
+}
+
+static ObjVec2Key MakeObjVec2Key (const aiVector3D& value)
+{
+	return { FloatBits (value.x), FloatBits (value.y) };
+}
+
+static std::string GetObjMaterialName (const aiMaterial* mat, unsigned int materialIndex, std::unordered_map<std::string, size_t>& counts)
+{
+	aiString aiName;
+	std::string raw = "mat_" + std::to_string (materialIndex);
+	if (mat != nullptr && mat->Get (AI_MATKEY_NAME, aiName) == AI_SUCCESS && aiName.length > 0) {
+		raw = aiName.C_Str ();
+	}
+	return SanitizeUsdIdentifier (raw, materialIndex, counts);
+}
+
+static bool TryGetMaterialTexturePath (const aiMaterial* mat, aiTextureType type, std::string& outPath)
+{
+	if (mat == nullptr) {
+		return false;
+	}
+	aiString path;
+	if (mat->GetTexture (type, 0, &path) != AI_SUCCESS || path.length == 0) {
+		return false;
+	}
+	outPath = path.C_Str ();
+	return !outPath.empty ();
+}
+
+static float RoughnessToLegacyShininess (float roughness)
+{
+	const float clamped = std::max (0.0f, std::min (1.0f, roughness));
+	const float gloss = 1.0f - clamped;
+	return gloss * gloss * 1000.0f;
+}
+
+static bool TryCopyTextureUvTransform (aiMaterial* mat, aiTextureType sourceType, aiTextureType targetType)
+{
+	if (mat == nullptr) {
+		return false;
+	}
+	aiUVTransform trafo;
+	unsigned int max = sizeof (aiUVTransform);
+	if (aiGetMaterialFloatArray (mat, AI_MATKEY_UVTRANSFORM (sourceType, 0), reinterpret_cast<ai_real*> (&trafo), &max) != aiReturn_SUCCESS) {
+		return false;
+	}
+	mat->AddProperty (&trafo, 1, AI_MATKEY_UVTRANSFORM (targetType, 0));
+	return true;
+}
+
+static void PrepareFbxLegacyPbrFallbacks (aiScene* scene)
+{
+	if (scene == nullptr || scene->mMaterials == nullptr) {
+		return;
+	}
+
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		aiMaterial* mat = scene->mMaterials[i];
+		if (mat == nullptr) {
+			continue;
+		}
+
+		std::string metallicPath;
+		aiTextureType metallicSourceType = aiTextureType_NONE;
+		if (TryGetMaterialTexturePath (mat, aiTextureType_GLTF_METALLIC_ROUGHNESS, metallicPath)) {
+			metallicSourceType = aiTextureType_GLTF_METALLIC_ROUGHNESS;
+		} else if (TryGetMaterialTexturePath (mat, aiTextureType_METALNESS, metallicPath)) {
+			metallicSourceType = aiTextureType_METALNESS;
+		} else if (TryGetMaterialTexturePath (mat, aiTextureType_UNKNOWN, metallicPath)) {
+			metallicSourceType = aiTextureType_UNKNOWN;
+		}
+		if (!metallicPath.empty () && mat->GetTextureCount (aiTextureType_SPECULAR) == 0) {
+			aiString path (metallicPath);
+			mat->AddProperty (&path, AI_MATKEY_TEXTURE (aiTextureType_SPECULAR, 0));
+			TryCopyTextureUvTransform (mat, metallicSourceType, aiTextureType_SPECULAR);
+		}
+
+		std::string roughnessPath;
+		aiTextureType roughnessSourceType = aiTextureType_NONE;
+		if (TryGetMaterialTexturePath (mat, aiTextureType_GLTF_METALLIC_ROUGHNESS, roughnessPath)) {
+			roughnessSourceType = aiTextureType_GLTF_METALLIC_ROUGHNESS;
+		} else if (TryGetMaterialTexturePath (mat, aiTextureType_DIFFUSE_ROUGHNESS, roughnessPath)) {
+			roughnessSourceType = aiTextureType_DIFFUSE_ROUGHNESS;
+		} else if (TryGetMaterialTexturePath (mat, aiTextureType_UNKNOWN, roughnessPath)) {
+			roughnessSourceType = aiTextureType_UNKNOWN;
+		}
+		if (!roughnessPath.empty () && mat->GetTextureCount (aiTextureType_SHININESS) == 0) {
+			aiString path (roughnessPath);
+			mat->AddProperty (&path, AI_MATKEY_TEXTURE (aiTextureType_SHININESS, 0));
+			TryCopyTextureUvTransform (mat, roughnessSourceType, aiTextureType_SHININESS);
+		}
+
+		if (mat->GetTextureCount (aiTextureType_LIGHTMAP) > 0 && mat->GetTextureCount (aiTextureType_AMBIENT) == 0) {
+			std::string aoPath;
+			if (TryGetMaterialTexturePath (mat, aiTextureType_LIGHTMAP, aoPath)) {
+				aiString path (aoPath);
+				mat->AddProperty (&path, AI_MATKEY_TEXTURE (aiTextureType_AMBIENT, 0));
+				TryCopyTextureUvTransform (mat, aiTextureType_LIGHTMAP, aiTextureType_AMBIENT);
+			}
+		}
+
+		ai_real metallicFactor = 0.0f;
+		if (mat->Get (AI_MATKEY_METALLIC_FACTOR, metallicFactor) == AI_SUCCESS) {
+			aiColor3D specularColor (metallicFactor, metallicFactor, metallicFactor);
+			mat->AddProperty (&specularColor, 1, AI_MATKEY_COLOR_SPECULAR);
+			mat->AddProperty (&metallicFactor, 1, AI_MATKEY_REFLECTIVITY);
+		}
+
+		ai_real roughnessFactor = 1.0f;
+		if (mat->Get (AI_MATKEY_ROUGHNESS_FACTOR, roughnessFactor) == AI_SUCCESS) {
+			const float shininess = RoughnessToLegacyShininess (roughnessFactor);
+			mat->AddProperty (&shininess, 1, AI_MATKEY_SHININESS);
+		}
+	}
+}
+
+static bool ExportSceneObjCustom (const aiScene* scene, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
+{
+	if (scene == nullptr || scene->mRootNode == nullptr) {
+		result.errorCode = ErrorCode::ExportError;
+		return false;
+	}
+
+	std::vector<ObjMeshInstance> instances;
+	CollectObjMeshInstances (scene, scene->mRootNode, aiMatrix4x4 (), instances);
+	if (instances.empty ()) {
+		result.errorCode = ErrorCode::ExportError;
+		return false;
+	}
+
+	std::unordered_map<ObjVec3Key, size_t, ObjKeyHash> positionMap;
+	std::unordered_map<ObjVec2Key, size_t, ObjKeyHash> uvMap;
+	std::unordered_map<ObjVec3Key, size_t, ObjKeyHash> normalMap;
+	std::vector<aiVector3D> positions;
+	std::vector<aiVector3D> uvs;
+	std::vector<aiVector3D> normals;
+	positionMap.reserve (16384);
+	uvMap.reserve (16384);
+	normalMap.reserve (16384);
+
+	std::ostringstream obj;
+	std::ostringstream mtl;
+	obj << std::fixed << std::setprecision (9);
+	mtl << std::fixed << std::setprecision (9);
+
+	const std::string objFileName = GetFileNameFromFormat ("obj", projectName);
+	const std::string mtlFileName = projectName.empty () ? "result.mtl" : projectName + ".mtl";
+	obj << "mtllib " << mtlFileName << "\n";
+	if (metadata != nullptr && !metadata->taskId.empty ()) {
+		obj << "# Beijing VAST-" << metadata->taskId << "-AIGC Content\n";
+	}
+
+	std::unordered_map<std::string, size_t> materialNameCounts;
+	std::vector<std::string> materialNames (scene->mNumMaterials);
+	for (unsigned int materialIndex = 0; materialIndex < scene->mNumMaterials; ++materialIndex) {
+		const aiMaterial* mat = scene->mMaterials[materialIndex];
+		std::string materialName = GetObjMaterialName (mat, materialIndex, materialNameCounts);
+		materialNames[materialIndex] = materialName;
+
+		mtl << "newmtl " << materialName << "\n";
+		aiColor4D baseColor (0.8f, 0.8f, 0.8f, 1.0f);
+		if (mat != nullptr) {
+			aiColor4D color;
+			if (mat->Get (AI_MATKEY_BASE_COLOR, color) == AI_SUCCESS) {
+				baseColor = color;
+			} else if (mat->Get (AI_MATKEY_COLOR_DIFFUSE, color) == AI_SUCCESS) {
+				baseColor = color;
+			}
+			float opacity = 1.0f;
+			if (mat->Get (AI_MATKEY_OPACITY, opacity) == AI_SUCCESS) {
+				baseColor.a = opacity;
+			}
+		}
+		mtl << "Kd " << baseColor.r << " " << baseColor.g << " " << baseColor.b << "\n";
+		mtl << "d " << baseColor.a << "\n";
+		mtl << "illum 2\n";
+
+		std::string texturePath;
+		if (TryGetMaterialTexturePath (mat, aiTextureType_BASE_COLOR, texturePath) ||
+		    TryGetMaterialTexturePath (mat, aiTextureType_DIFFUSE, texturePath)) {
+			mtl << "map_Kd " << texturePath << "\n";
+		}
+		mtl << "\n";
+	}
+
+	auto appendPosition = [&](const aiVector3D& value) -> size_t {
+		ObjVec3Key key = MakeObjVec3Key (value);
+		auto it = positionMap.find (key);
+		if (it != positionMap.end ()) {
+			return it->second;
+		}
+		positions.push_back (value);
+		size_t index = positions.size ();
+		positionMap.emplace (key, index);
+		obj << "v " << value.x << " " << value.y << " " << value.z << "\n";
+		return index;
+	};
+
+	auto appendUV = [&](const aiVector3D& value) -> size_t {
+		ObjVec2Key key = MakeObjVec2Key (value);
+		auto it = uvMap.find (key);
+		if (it != uvMap.end ()) {
+			return it->second;
+		}
+		uvs.push_back (value);
+		size_t index = uvs.size ();
+		uvMap.emplace (key, index);
+		obj << "vt " << value.x << " " << value.y << "\n";
+		return index;
+	};
+
+	auto appendNormal = [&](const aiVector3D& value) -> size_t {
+		ObjVec3Key key = MakeObjVec3Key (value);
+		auto it = normalMap.find (key);
+		if (it != normalMap.end ()) {
+			return it->second;
+		}
+		normals.push_back (value);
+		size_t index = normals.size ();
+		normalMap.emplace (key, index);
+		obj << "vn " << value.x << " " << value.y << " " << value.z << "\n";
+		return index;
+	};
+
+	size_t unnamedCount = 0;
+	for (const ObjMeshInstance& instance : instances) {
+		if (instance.mesh == nullptr) {
+			continue;
+		}
+		std::string objectName = instance.name.empty () ? "object_" + std::to_string (++unnamedCount) : ToPartName (instance.name);
+		obj << "o " << objectName << "\n";
+		obj << "g " << objectName << "\n";
+		if (instance.mesh->mMaterialIndex < materialNames.size ()) {
+			obj << "usemtl " << materialNames[instance.mesh->mMaterialIndex] << "\n";
+		}
+
+		aiMatrix3x3 normalMatrix (instance.transform);
+		normalMatrix.Inverse ();
+		normalMatrix.Transpose ();
+
+		std::vector<size_t> positionIndices (instance.mesh->mNumVertices, 0);
+		std::vector<size_t> uvIndices (instance.mesh->mNumVertices, 0);
+		std::vector<size_t> normalIndices (instance.mesh->mNumVertices, 0);
+
+		for (unsigned int vertexIndex = 0; vertexIndex < instance.mesh->mNumVertices; ++vertexIndex) {
+			aiVector3D transformedPosition = instance.transform * instance.mesh->mVertices[vertexIndex];
+			positionIndices[vertexIndex] = appendPosition (transformedPosition);
+
+			if (instance.mesh->HasTextureCoords (0)) {
+				uvIndices[vertexIndex] = appendUV (instance.mesh->mTextureCoords[0][vertexIndex]);
+			}
+
+			if (instance.mesh->HasNormals ()) {
+				aiVector3D transformedNormal = normalMatrix * instance.mesh->mNormals[vertexIndex];
+				transformedNormal.Normalize ();
+				normalIndices[vertexIndex] = appendNormal (transformedNormal);
+			}
+		}
+
+		for (unsigned int faceIndex = 0; faceIndex < instance.mesh->mNumFaces; ++faceIndex) {
+			const aiFace& face = instance.mesh->mFaces[faceIndex];
+			if (face.mNumIndices == 0) {
+				continue;
+			}
+			obj << "f";
+			for (unsigned int indexIndex = 0; indexIndex < face.mNumIndices; ++indexIndex) {
+				const unsigned int vertexIndex = face.mIndices[indexIndex];
+				const size_t positionIndex = positionIndices[vertexIndex];
+				const size_t uvIndex = uvIndices[vertexIndex];
+				const size_t normalIndex = normalIndices[vertexIndex];
+				obj << " " << positionIndex;
+				if (instance.mesh->HasTextureCoords (0) || instance.mesh->HasNormals ()) {
+					obj << "/";
+					if (instance.mesh->HasTextureCoords (0)) {
+						obj << uvIndex;
+					}
+					if (instance.mesh->HasNormals ()) {
+						obj << "/" << normalIndex;
+					}
+				}
+			}
+			obj << "\n";
+		}
+	}
+
+	const std::string objText = obj.str ();
+	const std::string mtlText = mtl.str ();
+	result.fileList.AddFile (objFileName, Buffer (objText.begin (), objText.end ()));
+	result.fileList.AddFile (mtlFileName, Buffer (mtlText.begin (), mtlText.end ()));
+	result.errorCode = ErrorCode::NoError;
+	return true;
 }
 
 static void WriteMatrix4 (std::ostringstream& ss, const aiMatrix4x4& m)
@@ -677,9 +1306,96 @@ static void WriteXformOps (std::ostringstream& ss, const aiMatrix4x4& transform,
 	ss << "uniform token[] xformOpOrder = [\"xformOp:transform\"]\n";
 }
 
-static void WriteUsdMesh (std::ostringstream& ss, const aiMesh* mesh, const std::string& meshName, int indent)
+struct UsdSharedPositionMesh
+{
+	std::vector<aiVector3D> points;
+	std::vector<uint32_t> faceVertexCounts;
+	std::vector<uint32_t> faceVertexIndices;
+	std::vector<aiVector3D> faceVaryingNormals;
+	std::vector<aiVector3D> faceVaryingTexcoords;
+	bool hasNormals = false;
+	bool hasTexcoords = false;
+};
+
+static bool BuildUsdSharedPositionMesh (const aiMesh* mesh, const aiMatrix4x4& transform, bool applyTransform, UsdSharedPositionMesh& out)
 {
 	if (mesh == nullptr) {
+		return false;
+	}
+
+	out.points.clear ();
+	out.faceVertexCounts.clear ();
+	out.faceVertexIndices.clear ();
+	out.faceVaryingNormals.clear ();
+	out.faceVaryingTexcoords.clear ();
+	out.hasNormals = mesh->HasNormals ();
+	out.hasTexcoords = mesh->HasTextureCoords (0);
+
+	std::unordered_map<ObjVec3Key, uint32_t, ObjKeyHash> pointMap;
+	pointMap.reserve (mesh->mNumVertices);
+
+	aiMatrix3x3 normalMatrix;
+	if (applyTransform && out.hasNormals) {
+		normalMatrix = aiMatrix3x3 (transform);
+		normalMatrix.Inverse ();
+		normalMatrix.Transpose ();
+	}
+
+	for (unsigned int faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex) {
+		const aiFace& face = mesh->mFaces[faceIndex];
+		if (face.mNumIndices == 0) {
+			continue;
+		}
+		out.faceVertexCounts.push_back (face.mNumIndices);
+		for (unsigned int indexIndex = 0; indexIndex < face.mNumIndices; ++indexIndex) {
+			const unsigned int vertexIndex = face.mIndices[indexIndex];
+			if (vertexIndex >= mesh->mNumVertices) {
+				return false;
+			}
+
+			aiVector3D position = mesh->mVertices[vertexIndex];
+			if (applyTransform) {
+				position = transform * position;
+			}
+
+			ObjVec3Key key = MakeObjVec3Key (position);
+			auto it = pointMap.find (key);
+			uint32_t pointIndex = 0;
+			if (it != pointMap.end ()) {
+				pointIndex = it->second;
+			} else {
+				pointIndex = static_cast<uint32_t> (out.points.size ());
+				out.points.push_back (position);
+				pointMap.emplace (key, pointIndex);
+			}
+			out.faceVertexIndices.push_back (pointIndex);
+
+			if (out.hasNormals) {
+				aiVector3D normal = mesh->mNormals[vertexIndex];
+				if (applyTransform) {
+					normal = normalMatrix * normal;
+					normal.Normalize ();
+				}
+				out.faceVaryingNormals.push_back (normal);
+			}
+
+			if (out.hasTexcoords) {
+				out.faceVaryingTexcoords.push_back (mesh->mTextureCoords[0][vertexIndex]);
+			}
+		}
+	}
+
+	return true;
+}
+
+static void WriteUsdMesh (std::ostringstream& ss, const aiMesh* mesh, const std::string& meshName, int indent, bool mergeSharedPositions)
+{
+	if (mesh == nullptr) {
+		return;
+	}
+
+	UsdSharedPositionMesh sharedMesh;
+	if (mergeSharedPositions && !BuildUsdSharedPositionMesh (mesh, aiMatrix4x4 (), false, sharedMesh)) {
 		return;
 	}
 
@@ -690,65 +1406,110 @@ static void WriteUsdMesh (std::ostringstream& ss, const aiMesh* mesh, const std:
 
 	WriteIndent (ss, indent + 2);
 	ss << "point3f[] points = [";
-	for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-		WriteVec3 (ss, mesh->mVertices[v]);
-		if (v + 1 < mesh->mNumVertices) {
-			ss << ", ";
+	if (mergeSharedPositions) {
+		for (size_t v = 0; v < sharedMesh.points.size (); ++v) {
+			WriteVec3 (ss, sharedMesh.points[v]);
+			if (v + 1 < sharedMesh.points.size ()) {
+				ss << ", ";
+			}
+		}
+	} else {
+		for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+			WriteVec3 (ss, mesh->mVertices[v]);
+			if (v + 1 < mesh->mNumVertices) {
+				ss << ", ";
+			}
 		}
 	}
 	ss << "]\n";
 
 	WriteIndent (ss, indent + 2);
 	ss << "int[] faceVertexCounts = [";
-	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-		const aiFace& face = mesh->mFaces[f];
-		ss << face.mNumIndices;
-		if (f + 1 < mesh->mNumFaces) {
-			ss << ", ";
+	if (mergeSharedPositions) {
+		for (size_t f = 0; f < sharedMesh.faceVertexCounts.size (); ++f) {
+			ss << sharedMesh.faceVertexCounts[f];
+			if (f + 1 < sharedMesh.faceVertexCounts.size ()) {
+				ss << ", ";
+			}
+		}
+	} else {
+		for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+			const aiFace& face = mesh->mFaces[f];
+			ss << face.mNumIndices;
+			if (f + 1 < mesh->mNumFaces) {
+				ss << ", ";
+			}
 		}
 	}
 	ss << "]\n";
 
 	WriteIndent (ss, indent + 2);
 	ss << "int[] faceVertexIndices = [";
-	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-		const aiFace& face = mesh->mFaces[f];
-		for (unsigned int j = 0; j < face.mNumIndices; ++j) {
-			ss << face.mIndices[j];
-			bool last = (f + 1 == mesh->mNumFaces) && (j + 1 == face.mNumIndices);
-			if (!last) {
+	if (mergeSharedPositions) {
+		for (size_t i = 0; i < sharedMesh.faceVertexIndices.size (); ++i) {
+			ss << sharedMesh.faceVertexIndices[i];
+			if (i + 1 < sharedMesh.faceVertexIndices.size ()) {
 				ss << ", ";
+			}
+		}
+	} else {
+		for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+			const aiFace& face = mesh->mFaces[f];
+			for (unsigned int j = 0; j < face.mNumIndices; ++j) {
+				ss << face.mIndices[j];
+				bool last = (f + 1 == mesh->mNumFaces) && (j + 1 == face.mNumIndices);
+				if (!last) {
+					ss << ", ";
+				}
 			}
 		}
 	}
 	ss << "]\n";
 
-	if (mesh->HasNormals ()) {
+	if (mergeSharedPositions ? sharedMesh.hasNormals : mesh->HasNormals ()) {
 		WriteIndent (ss, indent + 2);
 		ss << "normal3f[] normals = [";
-		for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-			WriteVec3 (ss, mesh->mNormals[v]);
-			if (v + 1 < mesh->mNumVertices) {
-				ss << ", ";
+		if (mergeSharedPositions) {
+			for (size_t v = 0; v < sharedMesh.faceVaryingNormals.size (); ++v) {
+				WriteVec3 (ss, sharedMesh.faceVaryingNormals[v]);
+				if (v + 1 < sharedMesh.faceVaryingNormals.size ()) {
+					ss << ", ";
+				}
+			}
+		} else {
+			for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+				WriteVec3 (ss, mesh->mNormals[v]);
+				if (v + 1 < mesh->mNumVertices) {
+					ss << ", ";
+				}
 			}
 		}
 		ss << "]\n";
 		WriteIndent (ss, indent + 2);
-		ss << "uniform token normals:interpolation = \"vertex\"\n";
+		ss << "uniform token normals:interpolation = \"" << (mergeSharedPositions ? "faceVarying" : "vertex") << "\"\n";
 	}
 
-	if (mesh->HasTextureCoords (0)) {
+	if (mergeSharedPositions ? sharedMesh.hasTexcoords : mesh->HasTextureCoords (0)) {
 		WriteIndent (ss, indent + 2);
 		ss << "float2[] primvars:st = [";
-		for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
-			WriteVec2 (ss, mesh->mTextureCoords[0][v]);
-			if (v + 1 < mesh->mNumVertices) {
-				ss << ", ";
+		if (mergeSharedPositions) {
+			for (size_t v = 0; v < sharedMesh.faceVaryingTexcoords.size (); ++v) {
+				WriteVec2 (ss, sharedMesh.faceVaryingTexcoords[v]);
+				if (v + 1 < sharedMesh.faceVaryingTexcoords.size ()) {
+					ss << ", ";
+				}
+			}
+		} else {
+			for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+				WriteVec2 (ss, mesh->mTextureCoords[0][v]);
+				if (v + 1 < mesh->mNumVertices) {
+					ss << ", ";
+				}
 			}
 		}
 		ss << "]\n";
 		WriteIndent (ss, indent + 2);
-		ss << "uniform token primvars:st:interpolation = \"vertex\"\n";
+		ss << "uniform token primvars:st:interpolation = \"" << (mergeSharedPositions ? "faceVarying" : "vertex") << "\"\n";
 	}
 
 	WriteIndent (ss, indent);
@@ -771,7 +1532,7 @@ static bool NodeHasExportableContent (const aiNode* node)
 	return false;
 }
 
-static void WriteUsdNode (std::ostringstream& ss, const aiScene* scene, const aiNode* node, std::unordered_map<std::string, size_t>& nameCounts, int indent)
+static void WriteUsdNode (std::ostringstream& ss, const aiScene* scene, const aiNode* node, std::unordered_map<std::string, size_t>& nameCounts, int indent, bool mergeSharedPositions)
 {
 	if (node == nullptr || scene == nullptr || !NodeHasExportableContent (node)) {
 		return;
@@ -795,19 +1556,19 @@ static void WriteUsdNode (std::ostringstream& ss, const aiScene* scene, const ai
 				meshName = nodeName;
 			}
 			meshName = SanitizeUsdIdentifier (meshName, meshIndex, nameCounts);
-			WriteUsdMesh (ss, mesh, meshName, indent + 2);
+			WriteUsdMesh (ss, mesh, meshName, indent + 2, mergeSharedPositions);
 		}
 	}
 
 	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
-		WriteUsdNode (ss, scene, node->mChildren[i], nameCounts, indent + 2);
+		WriteUsdNode (ss, scene, node->mChildren[i], nameCounts, indent + 2, mergeSharedPositions);
 	}
 
 	WriteIndent (ss, indent);
 	ss << "}\n";
 }
 
-static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
+static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr, bool mergeSharedPositions = false)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -841,11 +1602,11 @@ static bool ExportSceneUsdFallback (const aiScene* scene, const std::string& for
 				meshName = "root_mesh";
 			}
 			meshName = SanitizeUsdIdentifier (meshName, meshIndex, nameCounts);
-			WriteUsdMesh (ss, mesh, meshName, 2);
+			WriteUsdMesh (ss, mesh, meshName, 2, mergeSharedPositions);
 		}
 	}
 	for (unsigned int i = 0; i < scene->mRootNode->mNumChildren; ++i) {
-		WriteUsdNode (ss, scene, scene->mRootNode->mChildren[i], nameCounts, 2);
+		WriteUsdNode (ss, scene, scene->mRootNode->mChildren[i], nameCounts, 2, mergeSharedPositions);
 	}
 
 	ss << "}\n";
@@ -1021,7 +1782,6 @@ static int32_t AddTexture (
 	std::string baseName = projectName.empty() ? "result" : projectName;
 	img.asset_identifier = "textures/" + baseName + "_" + paramName + "." + ext;
 	img.buffer_id = buf_id;
-	img.decoded   = false;
 
 	int64_t img_id = static_cast<int64_t> (rs.images.size ());
 	rs.images.emplace_back (std::move (img));
@@ -1064,7 +1824,7 @@ static void CollectMeshInstances (const aiScene* scene, const aiNode* node, cons
 	}
 }
 
-static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err, const std::string& projectName, const MetadataOptions* metadata = nullptr)
+static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScene& out, std::string& err, const std::string& projectName, const MetadataOptions* metadata = nullptr, bool mergeSharedPositions = false)
 {
 	if (scene == nullptr || scene->mRootNode == nullptr) {
 		err = "scene is null";
@@ -1234,67 +1994,120 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 		}
 		rmesh.prim_name = SanitizeUsdIdentifier (rawName, fallbackIndex++, nameCounts);
 		rmesh.display_name = rawName;
-		rmesh.is_single_indexable = true;
+		rmesh.is_single_indexable = !mergeSharedPositions;
 
 		// Link to material
 		if (inst.mesh->mMaterialIndex < scene->mNumMaterials) {
 			rmesh.material_id = static_cast<int> (inst.mesh->mMaterialIndex);
 		}
 
-		rmesh.points.resize (inst.mesh->mNumVertices);
-		for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
-			aiVector3D p = inst.transform * inst.mesh->mVertices[v];
-			rmesh.points[v][0] = p.x * 100.0f;
-			rmesh.points[v][1] = p.y * 100.0f;
-			rmesh.points[v][2] = p.z * 100.0f;
-		}
-
-		rmesh.usdFaceVertexCounts.reserve (inst.mesh->mNumFaces);
-		for (unsigned int f = 0; f < inst.mesh->mNumFaces; ++f) {
-			const aiFace& face = inst.mesh->mFaces[f];
-			rmesh.usdFaceVertexCounts.push_back (face.mNumIndices);
-			for (unsigned int j = 0; j < face.mNumIndices; ++j) {
-				rmesh.usdFaceVertexIndices.push_back (face.mIndices[j]);
+		if (mergeSharedPositions) {
+			UsdSharedPositionMesh sharedMesh;
+			if (!BuildUsdSharedPositionMesh (inst.mesh, inst.transform, true, sharedMesh)) {
+				err = "failed to build shared-position usd mesh";
+				return false;
 			}
-		}
 
-		if (inst.mesh->HasNormals ()) {
-			aiMatrix3x3 normalMatrix (inst.transform);
-			normalMatrix.Inverse ();
-			normalMatrix.Transpose ();
-			std::vector<float> normalData;
-			normalData.reserve (inst.mesh->mNumVertices * 3);
+			rmesh.points.resize (sharedMesh.points.size ());
+			for (size_t v = 0; v < sharedMesh.points.size (); ++v) {
+				const aiVector3D& p = sharedMesh.points[v];
+				rmesh.points[v][0] = p.x * 100.0f;
+				rmesh.points[v][1] = p.y * 100.0f;
+				rmesh.points[v][2] = p.z * 100.0f;
+			}
+
+			rmesh.usdFaceVertexCounts = sharedMesh.faceVertexCounts;
+			rmesh.usdFaceVertexIndices = sharedMesh.faceVertexIndices;
+
+			if (sharedMesh.hasNormals) {
+				std::vector<float> normalData;
+				normalData.reserve (sharedMesh.faceVaryingNormals.size () * 3);
+				for (const aiVector3D& n : sharedMesh.faceVaryingNormals) {
+					normalData.push_back (n.x);
+					normalData.push_back (n.y);
+					normalData.push_back (n.z);
+				}
+				tinyusdz::tydra::VertexAttribute normals;
+				normals.format      = tinyusdz::tydra::VertexAttributeFormat::Vec3;
+				normals.variability = tinyusdz::tydra::VertexVariability::FaceVarying;
+				normals.elementSize = 1;
+				normals.set_buffer (reinterpret_cast<const std::uint8_t*> (normalData.data ()),
+					normalData.size () * sizeof (float));
+				rmesh.normals = std::move (normals);
+			}
+
+			if (sharedMesh.hasTexcoords) {
+				std::vector<float> uvData;
+				uvData.reserve (sharedMesh.faceVaryingTexcoords.size () * 2);
+				for (const aiVector3D& uvValue : sharedMesh.faceVaryingTexcoords) {
+					uvData.push_back (uvValue.x);
+					uvData.push_back (uvValue.y);
+				}
+				tinyusdz::tydra::VertexAttribute uv;
+				uv.name        = "st";
+				uv.format      = tinyusdz::tydra::VertexAttributeFormat::Vec2;
+				uv.variability = tinyusdz::tydra::VertexVariability::FaceVarying;
+				uv.elementSize = 1;
+				uv.set_buffer (reinterpret_cast<const std::uint8_t*> (uvData.data ()),
+					uvData.size () * sizeof (float));
+				rmesh.texcoords[0] = std::move (uv);
+			}
+		} else {
+			rmesh.points.resize (inst.mesh->mNumVertices);
 			for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
-				aiVector3D n = normalMatrix * inst.mesh->mNormals[v];
-				n.Normalize ();
-				normalData.push_back (n.x);
-				normalData.push_back (n.y);
-				normalData.push_back (n.z);
+				aiVector3D p = inst.transform * inst.mesh->mVertices[v];
+				rmesh.points[v][0] = p.x * 100.0f;
+				rmesh.points[v][1] = p.y * 100.0f;
+				rmesh.points[v][2] = p.z * 100.0f;
 			}
-			tinyusdz::tydra::VertexAttribute normals;
-			normals.format      = tinyusdz::tydra::VertexAttributeFormat::Vec3;
-			normals.variability = tinyusdz::tydra::VertexVariability::Vertex;
-			normals.elementSize = 1;
-			normals.set_buffer (reinterpret_cast<const std::uint8_t*> (normalData.data ()),
-				normalData.size () * sizeof (float));
-			rmesh.normals = std::move (normals);
-		}
 
-		if (inst.mesh->HasTextureCoords (0)) {
-			std::vector<float> uvData;
-			uvData.reserve (inst.mesh->mNumVertices * 2);
-			for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
-				uvData.push_back (inst.mesh->mTextureCoords[0][v].x);
-				uvData.push_back (inst.mesh->mTextureCoords[0][v].y);
+			rmesh.usdFaceVertexCounts.reserve (inst.mesh->mNumFaces);
+			for (unsigned int f = 0; f < inst.mesh->mNumFaces; ++f) {
+				const aiFace& face = inst.mesh->mFaces[f];
+				rmesh.usdFaceVertexCounts.push_back (face.mNumIndices);
+				for (unsigned int j = 0; j < face.mNumIndices; ++j) {
+					rmesh.usdFaceVertexIndices.push_back (face.mIndices[j]);
+				}
 			}
-			tinyusdz::tydra::VertexAttribute uv;
-			uv.name        = "st";
-			uv.format      = tinyusdz::tydra::VertexAttributeFormat::Vec2;
-			uv.variability = tinyusdz::tydra::VertexVariability::Vertex;
-			uv.elementSize = 1;
-			uv.set_buffer (reinterpret_cast<const std::uint8_t*> (uvData.data ()),
-				uvData.size () * sizeof (float));
-			rmesh.texcoords[0] = std::move (uv);
+
+			if (inst.mesh->HasNormals ()) {
+				aiMatrix3x3 normalMatrix (inst.transform);
+				normalMatrix.Inverse ();
+				normalMatrix.Transpose ();
+				std::vector<float> normalData;
+				normalData.reserve (inst.mesh->mNumVertices * 3);
+				for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
+					aiVector3D n = normalMatrix * inst.mesh->mNormals[v];
+					n.Normalize ();
+					normalData.push_back (n.x);
+					normalData.push_back (n.y);
+					normalData.push_back (n.z);
+				}
+				tinyusdz::tydra::VertexAttribute normals;
+				normals.format      = tinyusdz::tydra::VertexAttributeFormat::Vec3;
+				normals.variability = tinyusdz::tydra::VertexVariability::Vertex;
+				normals.elementSize = 1;
+				normals.set_buffer (reinterpret_cast<const std::uint8_t*> (normalData.data ()),
+					normalData.size () * sizeof (float));
+				rmesh.normals = std::move (normals);
+			}
+
+			if (inst.mesh->HasTextureCoords (0)) {
+				std::vector<float> uvData;
+				uvData.reserve (inst.mesh->mNumVertices * 2);
+				for (unsigned int v = 0; v < inst.mesh->mNumVertices; ++v) {
+					uvData.push_back (inst.mesh->mTextureCoords[0][v].x);
+					uvData.push_back (inst.mesh->mTextureCoords[0][v].y);
+				}
+				tinyusdz::tydra::VertexAttribute uv;
+				uv.name        = "st";
+				uv.format      = tinyusdz::tydra::VertexAttributeFormat::Vec2;
+				uv.variability = tinyusdz::tydra::VertexVariability::Vertex;
+				uv.elementSize = 1;
+				uv.set_buffer (reinterpret_cast<const std::uint8_t*> (uvData.data ()),
+					uvData.size () * sizeof (float));
+				rmesh.texcoords[0] = std::move (uv);
+			}
 		}
 
 		out.meshes.emplace_back (std::move (rmesh));
@@ -1305,12 +2118,12 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 
 #endif
 
-static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr)
+static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr, bool mergeSharedPositions = false)
 {
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
 	tinyusdz::tydra::RenderScene renderScene;
 	std::string err;
-	if (!BuildTinyUsdScene (scene, renderScene, err, projectName, metadata)) {
+	if (!BuildTinyUsdScene (scene, renderScene, err, projectName, metadata, mergeSharedPositions)) {
 		result.errorCode = ErrorCode::ExportError;
 		return false;
 	}
@@ -1318,7 +2131,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	std::string usdaStr;
 	if (!tinyusdz::tydra::export_to_usda (renderScene, usdaStr, &warn, &err)) {
 		if (format == "usda") {
-			return ExportSceneUsdFallback (scene, format, result, projectName, metadata);
+			return ExportSceneUsdFallback (scene, format, result, projectName, metadata, mergeSharedPositions);
 		}
 		result.errorCode = ErrorCode::ExportError;
 		return false;
@@ -1426,7 +2239,7 @@ static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Res
 	result.errorCode = ErrorCode::NoError;
 	return true;
 #else
-	return ExportSceneUsdFallback (scene, format, result, projectName, metadata);
+	return ExportSceneUsdFallback (scene, format, result, projectName, metadata, mergeSharedPositions);
 #endif
 }
 
@@ -1461,127 +2274,6 @@ static void CollectMaterialParts (const aiScene* scene, TextureNamingContext& ct
 	ctx.partNameByMaterial = std::move (first);
 }
 
-// ── Vertex Welding ────────────────────────────────────────────────────────────
-// Merge vertices that share the same position (ignoring normals/UVs).
-// Normals are discarded here; call RebuildSmoothNormals afterwards.
-
-struct WeldKey {
-	int32_t x, y, z;
-	bool operator== (const WeldKey& o) const { return x == o.x && y == o.y && z == o.z; }
-};
-
-struct WeldKeyHash {
-	std::size_t operator() (const WeldKey& k) const {
-		std::size_t h = 2166136261u;
-		h = (h ^ static_cast<uint32_t> (k.x)) * 16777619u;
-		h = (h ^ static_cast<uint32_t> (k.y)) * 16777619u;
-		h = (h ^ static_cast<uint32_t> (k.z)) * 16777619u;
-		return h;
-	}
-};
-
-static void WeldMeshByPosition (aiMesh* mesh, float epsilon)
-{
-	if (!mesh || mesh->mNumVertices < 2 || mesh->mNumFaces == 0) return;
-
-	const float invEps = 1.0f / epsilon;
-	std::unordered_map<WeldKey, unsigned int, WeldKeyHash> posMap;
-	posMap.reserve (mesh->mNumVertices);
-
-	std::vector<unsigned int> remap (mesh->mNumVertices);
-	std::vector<unsigned int> canonical;
-	canonical.reserve (mesh->mNumVertices);
-
-	for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-		const aiVector3D& v = mesh->mVertices[i];
-		WeldKey key {
-			static_cast<int32_t> (std::floor (v.x * invEps + 0.5f)),
-			static_cast<int32_t> (std::floor (v.y * invEps + 0.5f)),
-			static_cast<int32_t> (std::floor (v.z * invEps + 0.5f))
-		};
-		auto ins = posMap.emplace (key, static_cast<unsigned int> (canonical.size ()));
-		if (ins.second) {
-			remap[i] = static_cast<unsigned int> (canonical.size ());
-			canonical.push_back (i);
-		} else {
-			remap[i] = ins.first->second;
-		}
-	}
-
-	const unsigned int newCount = static_cast<unsigned int> (canonical.size ());
-	if (newCount == mesh->mNumVertices) return;
-
-	// Compact positions
-	auto* newVerts = new aiVector3D[newCount];
-	for (unsigned int i = 0; i < newCount; ++i)
-		newVerts[i] = mesh->mVertices[canonical[i]];
-	delete[] mesh->mVertices;
-	mesh->mVertices = newVerts;
-
-	// Normals/tangents will be rebuilt — drop them now
-	delete[] mesh->mNormals;    mesh->mNormals    = nullptr;
-	delete[] mesh->mTangents;   mesh->mTangents   = nullptr;
-	delete[] mesh->mBitangents; mesh->mBitangents = nullptr;
-
-	// Compact UV channels (take canonical vertex's UV)
-	for (unsigned int ch = 0; ch < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++ch) {
-		if (!mesh->mTextureCoords[ch]) continue;
-		auto* newUV = new aiVector3D[newCount];
-		for (unsigned int i = 0; i < newCount; ++i)
-			newUV[i] = mesh->mTextureCoords[ch][canonical[i]];
-		delete[] mesh->mTextureCoords[ch];
-		mesh->mTextureCoords[ch] = newUV;
-	}
-
-	// Compact color channels
-	for (unsigned int ch = 0; ch < AI_MAX_NUMBER_OF_COLOR_SETS; ++ch) {
-		if (!mesh->mColors[ch]) continue;
-		auto* newCol = new aiColor4D[newCount];
-		for (unsigned int i = 0; i < newCount; ++i)
-			newCol[i] = mesh->mColors[ch][canonical[i]];
-		delete[] mesh->mColors[ch];
-		mesh->mColors[ch] = newCol;
-	}
-
-	// Remap face indices
-	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-		aiFace& face = mesh->mFaces[f];
-		for (unsigned int k = 0; k < face.mNumIndices; ++k)
-			face.mIndices[k] = remap[face.mIndices[k]];
-	}
-
-	mesh->mNumVertices = newCount;
-}
-
-// ── Normal Reconstruction ─────────────────────────────────────────────────────
-// Area-weighted smooth normals. Suitable for organic models.
-// For hard-surface with sharp edges, vertices at creases get averaged normals.
-
-static void RebuildSmoothNormals (aiMesh* mesh)
-{
-	if (!mesh || mesh->mNumVertices == 0 || mesh->mNumFaces == 0) return;
-
-	delete[] mesh->mNormals;
-	mesh->mNormals = new aiVector3D[mesh->mNumVertices];
-	for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
-		mesh->mNormals[i] = aiVector3D (0.0f, 0.0f, 0.0f);
-
-	// Accumulate area-weighted face normals (cross product magnitude = 2*area)
-	for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
-		const aiFace& face = mesh->mFaces[f];
-		if (face.mNumIndices < 3) continue;
-		const aiVector3D& v0 = mesh->mVertices[face.mIndices[0]];
-		const aiVector3D& v1 = mesh->mVertices[face.mIndices[1]];
-		const aiVector3D& v2 = mesh->mVertices[face.mIndices[2]];
-		aiVector3D fn = (v1 - v0) ^ (v2 - v0);
-		for (unsigned int k = 0; k < face.mNumIndices; ++k)
-			mesh->mNormals[face.mIndices[k]] += fn;
-	}
-
-	for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
-		mesh->mNormals[i].Normalize ();
-}
-
 static std::string GetExtFromPath (const std::string& path)
 {
 	auto pos = path.rfind ('.');
@@ -1591,7 +2283,7 @@ static std::string GetExtFromPath (const std::string& path)
 	return ext;
 }
 
-static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr, const std::string& inputFormat = "")
+static bool ExportScene (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr, const std::string& inputFormat = "", const FileList* sourceFiles = nullptr)
 {
 	if (scene == nullptr) {
 		result.errorCode = ErrorCode::ImportError;
@@ -1624,8 +2316,10 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		}
 	}
 
+	const bool inputIsGltf = (inputFormat == "glb" || inputFormat == "glb2" ||
+	                          inputFormat == "gltf" || inputFormat == "gltf2");
 	if (format == "usd" || format == "usda" || format == "usdc" || format == "usdz") {
-		return ExportSceneUsd (scene, format, result, projectName, metadata);
+		return ExportSceneUsd (scene, format, result, projectName, metadata, inputIsGltf);
 	}
 
 	const bool isGltfOutput =
@@ -1650,11 +2344,14 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	Assimp::ExportProperties exportProperties;
 	exportProperties.SetPropertyBool ("JSON_SKIP_WHITESPACES", true);
 	std::string fileName = GetFileNameFromFormat (format, projectName);
+	unsigned int exportPostprocess = 0u;
 	
 	// Map dae format to collada for Assimp's internal format identifier
 	std::string assimpFormat = format;
 	if (format == "dae") {
 		assimpFormat = "collada";
+	} else if (format == "fbx") {
+		assimpFormat = "fbx";
 	} else if (format == "stl") {
 		// Prefer binary STL to reduce memory usage and avoid stream failures.
 		assimpFormat = "stlb";
@@ -1662,14 +2359,22 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 	
 	TextureNamingContext naming;
 	naming.project = projectName.empty () ? std::string ("result") : projectName;
+	if (isFbxOutput) {
+		const size_t dotPos = fileName.find_last_of ('.');
+		naming.folderPrefix = fileName.substr (0, dotPos) + ".fbm";
+	}
 	CollectMaterialParts (scene, naming);
 	std::vector<EmbeddedTextureFile> extraFiles;
-	if (format == "fbx") {
-		extraFiles = ExtractEmbeddedTextures (mutableScene, "result.fbm", &naming.embeddedOriginal);
+	std::vector<RenamedTextureFile> renamedExternalFiles;
+	if (isFbxOutput) {
+		extraFiles = ExtractEmbeddedTextures (mutableScene, naming.folderPrefix, &naming.embeddedOriginal);
 	} else if (format == "obj" || format == "gltf" || format == "gltf2") {
 		extraFiles = ExtractEmbeddedTextures (mutableScene, "", &naming.embeddedOriginal);
 	}
-	RenameMaterialTextures (mutableScene, naming, extraFiles);
+	RenameMaterialTextures (mutableScene, naming, extraFiles, &renamedExternalFiles);
+	if (isFbxOutput) {
+		PrepareFbxLegacyPbrFallbacks (mutableScene);
+	}
 	// For GLB: update embedded texture mFilename so GLTF exporter can find them by name
 	if (format == "glb" || format == "glb2") {
 		UpdateEmbeddedTextureFilenames (mutableScene, naming);
@@ -1681,6 +2386,10 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		for (unsigned int i = 0; i < scene->mRootNode->mNumChildren; ++i) {
 			SyncMeshNamesFromNodes (scene->mRootNode->mChildren[i], mutableScene);
 		}
+	}
+
+	if (inputIsGltf && isStlOutput) {
+		SimplifySceneForStl (mutableScene);
 	}
 
 	if (format == "stl") {
@@ -1742,22 +2451,49 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		}
 	}
 
-	// Weld duplicate positions and rebuild smooth normals for formats that store
-	// normals per-face-vertex (OBJ/FBX). Only applied when input is GLB/GLTF,
-	// which expands vertices (no JoinIdenticalVertices at import). For other
-	// inputs (FBX, OBJ, ...) normals may be carefully authored — leave them.
-	const bool inputIsGltf = (inputFormat == "glb" || inputFormat == "glb2" ||
-	                          inputFormat == "gltf" || inputFormat == "gltf2");
-	if (inputIsGltf && (format == "obj" || format == "fbx")) {
-		for (unsigned int i = 0; i < mutableScene->mNumMeshes; ++i) {
-			WeldMeshByPosition (mutableScene->mMeshes[i], 1e-5f);
-			RebuildSmoothNormals (mutableScene->mMeshes[i]);
+	if (inputIsGltf && format == "obj") {
+		if (!ExportSceneObjCustom (mutableScene, result, projectName, metadata)) {
+			result.errorCode = ErrorCode::ExportError;
+			return false;
 		}
+		for (const auto& extra : extraFiles) {
+			if (result.fileList.GetFile (extra.path) == nullptr) {
+				result.fileList.AddFile (extra.path, extra.content);
+			}
+		}
+		std::string zipName = GetFileNameFromFormat ("obj", projectName);
+		zipName = zipName.substr (0, zipName.find_last_of ('.')) + ".zip";
+		if (!ReplaceFileListWithZip (result.fileList, zipName, result)) {
+			result.errorCode = ErrorCode::ExportError;
+			return false;
+		}
+		result.errorCode = ErrorCode::NoError;
+		return true;
+	}
+	if (inputIsGltf && isFbxOutput) {
+		constexpr ai_real kCreaseAngleDegrees = 60.0f;
+		exportProperties.SetPropertyFloat (AI_CONFIG_PP_GSN_MAX_SMOOTHING_ANGLE, kCreaseAngleDegrees);
+		exportProperties.SetPropertyBool ("assimpjs.fbx.join_position_vertices", true);
+		exportPostprocess |= aiProcess_ForceGenNormals;
+		exportPostprocess |= aiProcess_GenSmoothNormals;
+		exportPostprocess |= aiProcess_JoinIdenticalVertices;
+	}
+	if (inputIsGltf && isGltfOutput) {
+		// glTF uses a single shared index for all vertex attributes, so the only
+		// safe merge here is exact render-vertex deduplication.
+		exportPostprocess |= aiProcess_JoinIdenticalVertices;
+	}
+	if (inputIsGltf && format == "3mf") {
+		exportProperties.SetPropertyBool ("assimpjs.3mf.join_position_vertices", true);
+	}
+	if (inputIsGltf && isStlOutput) {
+		exportPostprocess |= aiProcess_ForceGenNormals;
+		exportPostprocess |= aiProcess_GenNormals;
 	}
 
 	aiReturn exportResult = aiReturn_FAILURE;
 	try {
-		exportResult = exporter.Export (mutableScene, assimpFormat.c_str (), fileName.c_str (), 0u, &exportProperties);
+		exportResult = exporter.Export (mutableScene, assimpFormat.c_str (), fileName.c_str (), exportPostprocess, &exportProperties);
 	} catch (const std::exception&) {
 		exportResult = aiReturn_FAILURE;
 	} catch (...) {
@@ -1776,6 +2512,17 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 			result.fileList.AddFile (extra.path, extra.content);
 		}
 	}
+	if (sourceFiles != nullptr) {
+		for (const RenamedTextureFile& renamed : renamedExternalFiles) {
+			if (result.fileList.GetFile (renamed.outputPath) != nullptr) {
+				continue;
+			}
+			const File* sourceFile = FindTextureSourceFile (*sourceFiles, renamed.sourcePath);
+			if (sourceFile != nullptr) {
+				result.fileList.AddFile (renamed.outputPath, sourceFile->content);
+			}
+		}
+	}
 
 	if (format == "obj") {
 		std::string zipName = GetFileNameFromFormat ("obj", projectName);
@@ -1785,7 +2532,7 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 			return false;
 		}
 	}
-	if (format == "fbx") {
+	if (isFbxOutput) {
 		std::string zipName = GetFileNameFromFormat ("fbx", projectName);
 		zipName = zipName.substr(0, zipName.find_last_of('.')) + ".zip";
 		if (!ReplaceFileListWithZip (result.fileList, zipName, result)) {
@@ -1914,7 +2661,7 @@ Result ConvertFile (const File& file, const std::string& format, const FileLoade
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (file.path));
+	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (file.path), nullptr);
 	return result;
 }
 
@@ -1943,7 +2690,7 @@ Result ConvertFileList (const FileList& fileList, const std::string& format, con
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	RemoveUnusedMaterials (mutableScene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath));
+	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath), &fileList);
 	return result;
 }
 
@@ -1980,7 +2727,7 @@ Result ConvertFileListWithTransform (const FileList& fileList, const std::string
 	}
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath));
+	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath), &fileList);
 	return result;
 }
 
@@ -2013,7 +2760,7 @@ Result ConvertFileListWithNodeTransforms (const FileList& fileList, const std::s
 	ApplyTransformsToNodesByName (scene->mRootNode, transformByName);
 	aiScene* mutableScene = const_cast<aiScene*> (scene);
 	ApplyMetadata (mutableScene, metadata);
-	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath));
+	ExportScene (mutableScene, format, result, projectName, metadata, GetExtFromPath (inputPath), &fileList);
 	return result;
 }
 
