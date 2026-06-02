@@ -1122,15 +1122,34 @@ static bool ExportSceneObjCustom (const aiScene* scene, Result& result, const st
 		return false;
 	}
 
+	size_t totalVertexCount = 0;
+	size_t totalUvVertexCount = 0;
+	size_t totalNormalVertexCount = 0;
+	for (const ObjMeshInstance& instance : instances) {
+		if (instance.mesh == nullptr) {
+			continue;
+		}
+		totalVertexCount += instance.mesh->mNumVertices;
+		if (instance.mesh->HasTextureCoords (0)) {
+			totalUvVertexCount += instance.mesh->mNumVertices;
+		}
+		if (instance.mesh->HasNormals ()) {
+			totalNormalVertexCount += instance.mesh->mNumVertices;
+		}
+	}
+
 	std::unordered_map<ObjVec3Key, size_t, ObjKeyHash> positionMap;
 	std::unordered_map<ObjVec2Key, size_t, ObjKeyHash> uvMap;
 	std::unordered_map<ObjVec3Key, size_t, ObjKeyHash> normalMap;
 	std::vector<aiVector3D> positions;
 	std::vector<aiVector3D> uvs;
 	std::vector<aiVector3D> normals;
-	positionMap.reserve (16384);
-	uvMap.reserve (16384);
-	normalMap.reserve (16384);
+	positionMap.reserve (totalVertexCount);
+	uvMap.reserve (totalUvVertexCount);
+	normalMap.reserve (totalNormalVertexCount);
+	positions.reserve (totalVertexCount);
+	uvs.reserve (totalUvVertexCount);
+	normals.reserve (totalNormalVertexCount);
 
 	std::ostringstream obj;
 	std::ostringstream mtl;
@@ -1228,23 +1247,33 @@ static bool ExportSceneObjCustom (const aiScene* scene, Result& result, const st
 			obj << "usemtl " << materialNames[instance.mesh->mMaterialIndex] << "\n";
 		}
 
+		const bool hasTexcoords = instance.mesh->HasTextureCoords (0);
+		const bool hasNormals = instance.mesh->HasNormals ();
 		aiMatrix3x3 normalMatrix (instance.transform);
-		normalMatrix.Inverse ();
-		normalMatrix.Transpose ();
+		if (hasNormals) {
+			normalMatrix.Inverse ();
+			normalMatrix.Transpose ();
+		}
 
 		std::vector<size_t> positionIndices (instance.mesh->mNumVertices, 0);
-		std::vector<size_t> uvIndices (instance.mesh->mNumVertices, 0);
-		std::vector<size_t> normalIndices (instance.mesh->mNumVertices, 0);
+		std::vector<size_t> uvIndices;
+		std::vector<size_t> normalIndices;
+		if (hasTexcoords) {
+			uvIndices.resize (instance.mesh->mNumVertices, 0);
+		}
+		if (hasNormals) {
+			normalIndices.resize (instance.mesh->mNumVertices, 0);
+		}
 
 		for (unsigned int vertexIndex = 0; vertexIndex < instance.mesh->mNumVertices; ++vertexIndex) {
 			aiVector3D transformedPosition = instance.transform * instance.mesh->mVertices[vertexIndex];
 			positionIndices[vertexIndex] = appendPosition (transformedPosition);
 
-			if (instance.mesh->HasTextureCoords (0)) {
+			if (hasTexcoords) {
 				uvIndices[vertexIndex] = appendUV (instance.mesh->mTextureCoords[0][vertexIndex]);
 			}
 
-			if (instance.mesh->HasNormals ()) {
+			if (hasNormals) {
 				aiVector3D transformedNormal = normalMatrix * instance.mesh->mNormals[vertexIndex];
 				transformedNormal.Normalize ();
 				normalIndices[vertexIndex] = appendNormal (transformedNormal);
@@ -1260,17 +1289,13 @@ static bool ExportSceneObjCustom (const aiScene* scene, Result& result, const st
 			for (unsigned int indexIndex = 0; indexIndex < face.mNumIndices; ++indexIndex) {
 				const unsigned int vertexIndex = face.mIndices[indexIndex];
 				const size_t positionIndex = positionIndices[vertexIndex];
-				const size_t uvIndex = uvIndices[vertexIndex];
-				const size_t normalIndex = normalIndices[vertexIndex];
 				obj << " " << positionIndex;
-				if (instance.mesh->HasTextureCoords (0) || instance.mesh->HasNormals ()) {
-					obj << "/";
-					if (instance.mesh->HasTextureCoords (0)) {
-						obj << uvIndex;
-					}
-					if (instance.mesh->HasNormals ()) {
-						obj << "/" << normalIndex;
-					}
+				if (hasTexcoords && hasNormals) {
+					obj << "/" << uvIndices[vertexIndex] << "/" << normalIndices[vertexIndex];
+				} else if (hasTexcoords) {
+					obj << "/" << uvIndices[vertexIndex];
+				} else if (hasNormals) {
+					obj << "//" << normalIndices[vertexIndex];
 				}
 			}
 			obj << "\n";
