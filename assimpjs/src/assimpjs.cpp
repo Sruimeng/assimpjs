@@ -17,12 +17,20 @@
 #include <cstring>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
+#include <memory>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "../../assimp/contrib/meshoptimizer/meshoptimizer.h"
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../assimp/contrib/stb/stb_image.h"
+
+extern "C" void* tdefl_write_image_to_png_file_in_memory (const void* pImage, int w, int h, int num_chans, size_t* pLen_out);
+extern "C" void mz_free (void* p);
 
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
 #include "tydra/render-data.hh"
@@ -1040,6 +1048,377 @@ static bool TryCopyTextureUvTransform (aiMaterial* mat, aiTextureType sourceType
 	}
 	mat->AddProperty (&trafo, 1, AI_MATKEY_UVTRANSFORM (targetType, 0));
 	return true;
+}
+
+static bool TryCopyTextureUvSource (aiMaterial* mat, aiTextureType sourceType, aiTextureType targetType)
+{
+	if (mat == nullptr) {
+		return false;
+	}
+	int uvIndex = 0;
+	if (mat->Get (AI_MATKEY_UVWSRC (sourceType, 0), uvIndex) != aiReturn_SUCCESS) {
+		return false;
+	}
+	mat->AddProperty (&uvIndex, 1, AI_MATKEY_UVWSRC (targetType, 0));
+	return true;
+}
+
+static void CopyTextureUvMetadata (aiMaterial* mat, aiTextureType sourceType, aiTextureType targetType)
+{
+	TryCopyTextureUvTransform (mat, sourceType, targetType);
+	TryCopyTextureUvSource (mat, sourceType, targetType);
+}
+
+static std::string ToLowerAscii (const std::string& value)
+{
+	std::string result = value;
+	for (char& c : result) {
+		c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
+	}
+	return result;
+}
+
+static bool PathLooksLikeRoughness (const std::string& path)
+{
+	const std::string lower = ToLowerAscii (path);
+	return lower.find ("rough") != std::string::npos && lower.find ("gloss") == std::string::npos;
+}
+
+static bool PathLooksLikeOcclusion (const std::string& path)
+{
+	const std::string lower = ToLowerAscii (path);
+	return lower.find ("ao") != std::string::npos || lower.find ("occlusion") != std::string::npos;
+}
+
+struct TextureSlotRef
+{
+	aiTextureType type = aiTextureType_NONE;
+	std::string path;
+};
+
+static bool TryFindTextureSlot (const aiMaterial* mat, aiTextureType type, TextureSlotRef& out)
+{
+	std::string path;
+	if (!TryGetMaterialTexturePath (mat, type, path)) {
+		return false;
+	}
+	out.type = type;
+	out.path = path;
+	return true;
+}
+
+static bool TryFindRoughnessTextureSlot (const aiMaterial* mat, TextureSlotRef& out)
+{
+	if (TryFindTextureSlot (mat, aiTextureType_DIFFUSE_ROUGHNESS, out)) {
+		return true;
+	}
+	TextureSlotRef shininess;
+	if (TryFindTextureSlot (mat, aiTextureType_SHININESS, shininess) && PathLooksLikeRoughness (shininess.path)) {
+		out = shininess;
+		return true;
+	}
+	TextureSlotRef unknown;
+	if (TryFindTextureSlot (mat, aiTextureType_UNKNOWN, unknown) && PathLooksLikeRoughness (unknown.path)) {
+		out = unknown;
+		return true;
+	}
+	return false;
+}
+
+static bool TryFindMetallicTextureSlot (const aiMaterial* mat, TextureSlotRef& out)
+{
+	if (TryFindTextureSlot (mat, aiTextureType_METALNESS, out)) {
+		return true;
+	}
+	TextureSlotRef unknown;
+	if (TryFindTextureSlot (mat, aiTextureType_UNKNOWN, unknown)) {
+		const std::string lower = ToLowerAscii (unknown.path);
+		if (lower.find ("metal") != std::string::npos) {
+			out = unknown;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool TryFindOcclusionTextureSlot (const aiMaterial* mat, TextureSlotRef& out)
+{
+	if (TryFindTextureSlot (mat, aiTextureType_LIGHTMAP, out)) {
+		return true;
+	}
+	if (TryFindTextureSlot (mat, aiTextureType_AMBIENT_OCCLUSION, out)) {
+		return true;
+	}
+	TextureSlotRef ambient;
+	if (TryFindTextureSlot (mat, aiTextureType_AMBIENT, ambient) && PathLooksLikeOcclusion (ambient.path)) {
+		out = ambient;
+		return true;
+	}
+	TextureSlotRef unknown;
+	if (TryFindTextureSlot (mat, aiTextureType_UNKNOWN, unknown) && PathLooksLikeOcclusion (unknown.path)) {
+		out = unknown;
+		return true;
+	}
+	return false;
+}
+
+struct RgbaImage
+{
+	int width = 0;
+	int height = 0;
+	std::vector<std::uint8_t> pixels;
+
+	bool IsValid () const
+	{
+		return width > 0 && height > 0 && pixels.size () == static_cast<size_t> (width) * static_cast<size_t> (height) * 4u;
+	}
+};
+
+static bool DecodeImageBytes (const std::uint8_t* data, size_t size, RgbaImage& out)
+{
+	if (data == nullptr || size == 0 || size > static_cast<size_t> (std::numeric_limits<int>::max ())) {
+		return false;
+	}
+	int width = 0;
+	int height = 0;
+	int channels = 0;
+	stbi_uc* decoded = stbi_load_from_memory (data, static_cast<int> (size), &width, &height, &channels, 4);
+	if (decoded == nullptr || width <= 0 || height <= 0) {
+		if (decoded != nullptr) {
+			stbi_image_free (decoded);
+		}
+		return false;
+	}
+	const size_t byteCount = static_cast<size_t> (width) * static_cast<size_t> (height) * 4u;
+	out.width = width;
+	out.height = height;
+	out.pixels.assign (decoded, decoded + byteCount);
+	stbi_image_free (decoded);
+	return out.IsValid ();
+}
+
+static bool DecodeAiTexture (const aiTexture* tex, RgbaImage& out)
+{
+	if (tex == nullptr || tex->pcData == nullptr) {
+		return false;
+	}
+	if (tex->mHeight == 0) {
+		const std::uint8_t* data = reinterpret_cast<const std::uint8_t*> (tex->pcData);
+		return DecodeImageBytes (data, static_cast<size_t> (tex->mWidth), out);
+	}
+	const size_t texelCount = static_cast<size_t> (tex->mWidth) * static_cast<size_t> (tex->mHeight);
+	if (tex->mWidth == 0 || tex->mHeight == 0 || texelCount > static_cast<size_t> (std::numeric_limits<int>::max ())) {
+		return false;
+	}
+	out.width = static_cast<int> (tex->mWidth);
+	out.height = static_cast<int> (tex->mHeight);
+	out.pixels.resize (texelCount * 4u);
+	for (size_t i = 0; i < texelCount; ++i) {
+		const aiTexel& src = tex->pcData[i];
+		out.pixels[i * 4u + 0u] = src.r;
+		out.pixels[i * 4u + 1u] = src.g;
+		out.pixels[i * 4u + 2u] = src.b;
+		out.pixels[i * 4u + 3u] = src.a;
+	}
+	return out.IsValid ();
+}
+
+static bool LoadMaterialTextureImage (const aiScene* scene, const FileList* sourceFiles, const std::string& path, RgbaImage& out)
+{
+	if (path.empty ()) {
+		return false;
+	}
+	if (scene != nullptr) {
+		const aiTexture* embedded = scene->GetEmbeddedTexture (path.c_str ());
+		if (embedded != nullptr && DecodeAiTexture (embedded, out)) {
+			return true;
+		}
+	}
+	if (sourceFiles != nullptr) {
+		const File* file = FindTextureSourceFile (*sourceFiles, path);
+		if (file != nullptr && !file->content.empty ()) {
+			return DecodeImageBytes (file->content.data (), file->content.size (), out);
+		}
+	}
+	return false;
+}
+
+static std::uint8_t ClampToByte (float value)
+{
+	const float clamped = std::max (0.0f, std::min (1.0f, value));
+	return static_cast<std::uint8_t> (std::round (clamped * 255.0f));
+}
+
+static std::uint8_t SampleImageLuma (const RgbaImage& image, int x, int y, int targetWidth, int targetHeight)
+{
+	if (!image.IsValid () || targetWidth <= 0 || targetHeight <= 0) {
+		return 255;
+	}
+	const int sx = std::min (image.width - 1, std::max (0, (x * image.width) / targetWidth));
+	const int sy = std::min (image.height - 1, std::max (0, (y * image.height) / targetHeight));
+	const size_t index = (static_cast<size_t> (sy) * static_cast<size_t> (image.width) + static_cast<size_t> (sx)) * 4u;
+	const float r = static_cast<float> (image.pixels[index + 0u]);
+	const float g = static_cast<float> (image.pixels[index + 1u]);
+	const float b = static_cast<float> (image.pixels[index + 2u]);
+	return static_cast<std::uint8_t> (std::round (r * 0.2126f + g * 0.7152f + b * 0.0722f));
+}
+
+static bool EncodePngRgba (const std::vector<std::uint8_t>& pixels, int width, int height, std::vector<std::uint8_t>& out)
+{
+	if (width <= 0 || height <= 0 || pixels.size () != static_cast<size_t> (width) * static_cast<size_t> (height) * 4u) {
+		return false;
+	}
+	size_t pngSize = 0;
+	void* png = tdefl_write_image_to_png_file_in_memory (pixels.data (), width, height, 4, &pngSize);
+	if (png == nullptr || pngSize == 0) {
+		return false;
+	}
+	const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*> (png);
+	out.assign (bytes, bytes + pngSize);
+	mz_free (png);
+	return !out.empty ();
+}
+
+static std::string AddEmbeddedPngTexture (aiScene* scene, const std::string& name, const std::vector<std::uint8_t>& pngBytes)
+{
+	if (scene == nullptr || pngBytes.empty () || pngBytes.size () > static_cast<size_t> (std::numeric_limits<unsigned int>::max ())) {
+		return std::string ();
+	}
+	auto* tex = new aiTexture ();
+	tex->mWidth = static_cast<unsigned int> (pngBytes.size ());
+	tex->mHeight = 0;
+	std::strncpy (tex->achFormatHint, "png", sizeof (tex->achFormatHint) - 1u);
+	tex->mFilename = aiString (name);
+	const size_t texelCount = (pngBytes.size () + sizeof (aiTexel) - 1u) / sizeof (aiTexel);
+	tex->pcData = new aiTexel[texelCount];
+	std::memset (tex->pcData, 0, texelCount * sizeof (aiTexel));
+	std::memcpy (tex->pcData, pngBytes.data (), pngBytes.size ());
+
+	const unsigned int newIndex = scene->mNumTextures;
+	auto** newTextures = new aiTexture*[static_cast<size_t> (newIndex) + 1u];
+	for (unsigned int i = 0; i < scene->mNumTextures; ++i) {
+		newTextures[i] = scene->mTextures[i];
+	}
+	newTextures[newIndex] = tex;
+	delete[] scene->mTextures;
+	scene->mTextures = newTextures;
+	scene->mNumTextures = newIndex + 1u;
+	return "*" + std::to_string (newIndex);
+}
+
+static void SetTexturePath (aiMaterial* mat, aiTextureType type, const std::string& path)
+{
+	if (mat == nullptr || path.empty ()) {
+		return;
+	}
+	aiString aiPath (path);
+	mat->AddProperty (&aiPath, AI_MATKEY_TEXTURE (type, 0));
+}
+
+static void PrepareGltfPackedPbrTextures (aiScene* scene, const FileList* sourceFiles, const std::string& projectName)
+{
+	if (scene == nullptr || scene->mMaterials == nullptr) {
+		return;
+	}
+
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		aiMaterial* mat = scene->mMaterials[i];
+		if (mat == nullptr) {
+			continue;
+		}
+
+		TextureSlotRef existingPacked;
+		const bool hasExistingPacked = TryFindTextureSlot (mat, aiTextureType_GLTF_METALLIC_ROUGHNESS, existingPacked);
+		TextureSlotRef roughness;
+		TextureSlotRef metallic;
+		TextureSlotRef occlusion;
+		const bool hasRoughness = TryFindRoughnessTextureSlot (mat, roughness);
+		const bool hasMetallic = TryFindMetallicTextureSlot (mat, metallic);
+		const bool hasOcclusion = TryFindOcclusionTextureSlot (mat, occlusion);
+
+		if (hasExistingPacked && (!hasRoughness || roughness.path == existingPacked.path) && (!hasMetallic || metallic.path == existingPacked.path)) {
+			if (hasOcclusion && occlusion.type == aiTextureType_AMBIENT_OCCLUSION) {
+				SetTexturePath (mat, aiTextureType_LIGHTMAP, occlusion.path);
+				CopyTextureUvMetadata (mat, occlusion.type, aiTextureType_LIGHTMAP);
+			}
+			continue;
+		}
+		if (hasRoughness && hasMetallic && roughness.path == metallic.path) {
+			if (roughness.type != aiTextureType_DIFFUSE_ROUGHNESS) {
+				SetTexturePath (mat, aiTextureType_DIFFUSE_ROUGHNESS, roughness.path);
+				CopyTextureUvMetadata (mat, roughness.type, aiTextureType_DIFFUSE_ROUGHNESS);
+			}
+			continue;
+		}
+		if (!hasRoughness && !hasMetallic) {
+			if (hasOcclusion && occlusion.type == aiTextureType_AMBIENT_OCCLUSION) {
+				SetTexturePath (mat, aiTextureType_LIGHTMAP, occlusion.path);
+				CopyTextureUvMetadata (mat, occlusion.type, aiTextureType_LIGHTMAP);
+			}
+			continue;
+		}
+
+		RgbaImage roughnessImage;
+		RgbaImage metallicImage;
+		RgbaImage occlusionImage;
+		const bool loadedRoughness = hasRoughness && LoadMaterialTextureImage (scene, sourceFiles, roughness.path, roughnessImage);
+		const bool loadedMetallic = hasMetallic && LoadMaterialTextureImage (scene, sourceFiles, metallic.path, metallicImage);
+		const bool loadedOcclusion = hasOcclusion && LoadMaterialTextureImage (scene, sourceFiles, occlusion.path, occlusionImage);
+		if (!loadedRoughness && !loadedMetallic) {
+			continue;
+		}
+
+		int width = loadedRoughness ? roughnessImage.width : metallicImage.width;
+		int height = loadedRoughness ? roughnessImage.height : metallicImage.height;
+		if (width <= 0 || height <= 0) {
+			continue;
+		}
+
+		float roughnessFactor = 1.0f;
+		if (mat->Get (AI_MATKEY_ROUGHNESS_FACTOR, roughnessFactor) != AI_SUCCESS) {
+			roughnessFactor = 1.0f;
+		}
+		float metallicFactor = 0.0f;
+		if (mat->Get (AI_MATKEY_METALLIC_FACTOR, metallicFactor) != AI_SUCCESS) {
+			metallicFactor = 0.0f;
+		}
+		const std::uint8_t defaultRoughness = ClampToByte (roughnessFactor);
+		const std::uint8_t defaultMetallic = ClampToByte (metallicFactor);
+
+		std::vector<std::uint8_t> packed (static_cast<size_t> (width) * static_cast<size_t> (height) * 4u, 255);
+		for (int y = 0; y < height; ++y) {
+			for (int x = 0; x < width; ++x) {
+				const size_t index = (static_cast<size_t> (y) * static_cast<size_t> (width) + static_cast<size_t> (x)) * 4u;
+				packed[index + 0u] = loadedOcclusion ? SampleImageLuma (occlusionImage, x, y, width, height) : 255;
+				packed[index + 1u] = loadedRoughness ? SampleImageLuma (roughnessImage, x, y, width, height) : defaultRoughness;
+				packed[index + 2u] = loadedMetallic ? SampleImageLuma (metallicImage, x, y, width, height) : defaultMetallic;
+				packed[index + 3u] = 255;
+			}
+		}
+
+		std::vector<std::uint8_t> pngBytes;
+		if (!EncodePngRgba (packed, width, height, pngBytes)) {
+			continue;
+		}
+		const std::string base = projectName.empty () ? "result" : projectName;
+		const std::string embeddedPath = AddEmbeddedPngTexture (scene, base + "_orm_" + std::to_string (i) + ".png", pngBytes);
+		if (embeddedPath.empty ()) {
+			continue;
+		}
+
+		SetTexturePath (mat, aiTextureType_DIFFUSE_ROUGHNESS, embeddedPath);
+		SetTexturePath (mat, aiTextureType_GLTF_METALLIC_ROUGHNESS, embeddedPath);
+		CopyTextureUvMetadata (mat, loadedRoughness ? roughness.type : metallic.type, aiTextureType_DIFFUSE_ROUGHNESS);
+
+		if (loadedOcclusion) {
+			SetTexturePath (mat, aiTextureType_LIGHTMAP, embeddedPath);
+			CopyTextureUvMetadata (mat, occlusion.type, aiTextureType_LIGHTMAP);
+		}
+
+		const float one = 1.0f;
+		mat->AddProperty (&one, 1, AI_MATKEY_METALLIC_FACTOR);
+		mat->AddProperty (&one, 1, AI_MATKEY_ROUGHNESS_FACTOR);
+	}
 }
 
 static void PrepareFbxLegacyPbrFallbacks (aiScene* scene)
@@ -2382,6 +2761,10 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		assimpFormat = "stlb";
 	}
 	
+	if (isGltfOutput) {
+		PrepareGltfPackedPbrTextures (mutableScene, sourceFiles, projectName);
+	}
+
 	TextureNamingContext naming;
 	naming.project = projectName.empty () ? std::string ("result") : projectName;
 	if (isFbxOutput) {
