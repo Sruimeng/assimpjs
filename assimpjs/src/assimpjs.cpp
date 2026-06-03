@@ -635,12 +635,74 @@ static std::string ToPartName (const std::string& raw)
 	return res;
 }
 
+static std::string ToLowerAscii (const std::string& value)
+{
+	std::string result = value;
+	for (char& c : result) {
+		c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
+	}
+	return result;
+}
+
+static bool EndsWith (const std::string& value, const std::string& suffix)
+{
+	return value.size () >= suffix.size () && value.compare (value.size () - suffix.size (), suffix.size (), suffix) == 0;
+}
+
+static std::string StripTextureRoleSuffix (const std::string& value)
+{
+	static const std::vector<std::string> suffixes = {
+		"_normal_bake", "_base_color", "_basecolor", "_roughness", "_metalness",
+		"_metallic", "_occlusion", "_diffuse", "_albedo", "_normal",
+		"_orm", "_rma", "_rm", "_ao"
+	};
+	const std::string lower = ToLowerAscii (value);
+	for (const std::string& suffix : suffixes) {
+		if (EndsWith (lower, suffix)) {
+			return value.substr (0, value.size () - suffix.size ());
+		}
+	}
+	return value;
+}
+
+static std::string NormalizeTextureBaseName (const std::string& rawName)
+{
+	const std::string base = rawName.empty () ? std::string ("result") : rawName;
+	std::vector<std::string> parts;
+	size_t start = 0;
+	while (start <= base.size ()) {
+		const size_t sep = base.find ('-', start);
+		const std::string part = base.substr (start, sep == std::string::npos ? std::string::npos : sep - start);
+		if (!part.empty ()) {
+			parts.push_back (StripTextureRoleSuffix (part));
+		}
+		if (sep == std::string::npos) {
+			break;
+		}
+		start = sep + 1;
+	}
+	if (parts.size () > 1) {
+		bool sameRoot = !parts[0].empty ();
+		for (size_t i = 1; i < parts.size (); ++i) {
+			if (parts[i] != parts[0]) {
+				sameRoot = false;
+				break;
+			}
+		}
+		if (sameRoot) {
+			return parts[0];
+		}
+	}
+	return StripTextureRoleSuffix (base);
+}
+
 static std::string ComposeTexBase (const TextureNamingContext& ctx, const std::string& part)
 {
+	const std::string projectBase = NormalizeTextureBaseName (ctx.project);
 	if (ctx.multiPart && !part.empty ()) {
-		return ctx.project + "_" + part;
+		return projectBase + "_" + part;
 	}
-	return ctx.project;
+	return projectBase;
 }
 
 static std::string ApplyTextureFolderPrefix (const TextureNamingContext& ctx, const std::string& fileName)
@@ -740,6 +802,24 @@ static void RenameMaterialTextures (
 		processType (aiTextureType_DIFFUSE, "_basecolor");
 		processType (aiTextureType_NORMALS, "_normal");
 		processType (aiTextureType_NORMAL_CAMERA, "_normal");
+		std::string roughnessPath;
+		std::string packedPath;
+		auto getTexturePath = [&] (aiTextureType t, std::string& outPath) -> bool {
+			aiString path;
+			if (mat->GetTexture (t, 0, &path) != aiReturn_SUCCESS || path.length == 0) {
+				return false;
+			}
+			outPath = path.C_Str ();
+			return !outPath.empty ();
+		};
+		const bool roughnessIsPacked =
+			getTexturePath (aiTextureType_DIFFUSE_ROUGHNESS, roughnessPath) &&
+			getTexturePath (aiTextureType_GLTF_METALLIC_ROUGHNESS, packedPath) &&
+			roughnessPath == packedPath;
+		processType (aiTextureType_DIFFUSE_ROUGHNESS, roughnessIsPacked ? "_rm" : "_roughness");
+		processType (aiTextureType_METALNESS, "_metallic");
+		processType (aiTextureType_LIGHTMAP, "_ao");
+		processType (aiTextureType_AMBIENT_OCCLUSION, "_ao");
 		processType (aiTextureType_GLTF_METALLIC_ROUGHNESS, "_rm");
 		processType (aiTextureType_UNKNOWN, "_rm"); // catch ORM packed in UNKNOWN
 	}
@@ -1069,15 +1149,6 @@ static void CopyTextureUvMetadata (aiMaterial* mat, aiTextureType sourceType, ai
 	TryCopyTextureUvSource (mat, sourceType, targetType);
 }
 
-static std::string ToLowerAscii (const std::string& value)
-{
-	std::string result = value;
-	for (char& c : result) {
-		c = static_cast<char> (std::tolower (static_cast<unsigned char> (c)));
-	}
-	return result;
-}
-
 static bool PathLooksLikeRoughness (const std::string& path)
 {
 	const std::string lower = ToLowerAscii (path);
@@ -1315,6 +1386,50 @@ static void SetTexturePath (aiMaterial* mat, aiTextureType type, const std::stri
 	mat->AddProperty (&aiPath, AI_MATKEY_TEXTURE (type, 0));
 }
 
+static void RemoveTextureSlot (aiMaterial* mat, aiTextureType type)
+{
+	if (mat == nullptr) {
+		return;
+	}
+	mat->RemoveProperty (AI_MATKEY_TEXTURE (type, 0));
+	mat->RemoveProperty (AI_MATKEY_UVTRANSFORM (type, 0));
+	mat->RemoveProperty (AI_MATKEY_UVWSRC (type, 0));
+}
+
+static void PrepareStandardPbrTextureSlots (aiScene* scene)
+{
+	if (scene == nullptr || scene->mMaterials == nullptr) {
+		return;
+	}
+	for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+		aiMaterial* mat = scene->mMaterials[i];
+		if (mat == nullptr) {
+			continue;
+		}
+
+		TextureSlotRef roughness;
+		if (TryFindRoughnessTextureSlot (mat, roughness) && roughness.type != aiTextureType_DIFFUSE_ROUGHNESS) {
+			SetTexturePath (mat, aiTextureType_DIFFUSE_ROUGHNESS, roughness.path);
+			CopyTextureUvMetadata (mat, roughness.type, aiTextureType_DIFFUSE_ROUGHNESS);
+			if (roughness.type == aiTextureType_SHININESS && PathLooksLikeRoughness (roughness.path)) {
+				RemoveTextureSlot (mat, aiTextureType_SHININESS);
+			}
+		}
+
+		TextureSlotRef metallic;
+		if (TryFindMetallicTextureSlot (mat, metallic) && metallic.type != aiTextureType_METALNESS) {
+			SetTexturePath (mat, aiTextureType_METALNESS, metallic.path);
+			CopyTextureUvMetadata (mat, metallic.type, aiTextureType_METALNESS);
+		}
+
+		TextureSlotRef occlusion;
+		if (TryFindOcclusionTextureSlot (mat, occlusion) && occlusion.type != aiTextureType_LIGHTMAP) {
+			SetTexturePath (mat, aiTextureType_LIGHTMAP, occlusion.path);
+			CopyTextureUvMetadata (mat, occlusion.type, aiTextureType_LIGHTMAP);
+		}
+	}
+}
+
 static void PrepareGltfPackedPbrTextures (aiScene* scene, const FileList* sourceFiles, const std::string& projectName)
 {
 	if (scene == nullptr || scene->mMaterials == nullptr) {
@@ -1400,7 +1515,7 @@ static void PrepareGltfPackedPbrTextures (aiScene* scene, const FileList* source
 		if (!EncodePngRgba (packed, width, height, pngBytes)) {
 			continue;
 		}
-		const std::string base = projectName.empty () ? "result" : projectName;
+		const std::string base = NormalizeTextureBaseName (projectName.empty () ? "result" : projectName);
 		const std::string embeddedPath = AddEmbeddedPngTexture (scene, base + "_orm_" + std::to_string (i) + ".png", pngBytes);
 		if (embeddedPath.empty ()) {
 			continue;
@@ -2183,9 +2298,12 @@ static int32_t AddTexture (
 
 	// TextureImage — asset_identifier is the filename inside the USDZ.
 	tinyusdz::tydra::TextureImage img;
-	std::string baseName = projectName.empty() ? "result" : projectName;
+	std::string baseName = NormalizeTextureBaseName (projectName.empty() ? "result" : projectName);
 	img.asset_identifier = "textures/" + baseName + "_" + paramName + "." + ext;
 	img.buffer_id = buf_id;
+	const bool isColorTexture = paramName == "baseColor" || paramName == "emissive";
+	img.colorSpace = isColorTexture ? tinyusdz::tydra::ColorSpace::sRGB : tinyusdz::tydra::ColorSpace::Raw;
+	img.usdColorSpace = img.colorSpace;
 
 	int64_t img_id = static_cast<int64_t> (rs.images.size ());
 	rs.images.emplace_back (std::move (img));
@@ -2335,6 +2453,15 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 				"roughness", texCache, out, projectName);
 			if (tid >= 0) {
 				pss.roughness.texture_id = tid;
+			}
+		}
+
+		// Ambient occlusion texture
+		{
+			int32_t tid = AddTexture (scene, aimat, aiTextureType_LIGHTMAP,
+				"occlusion", texCache, out, projectName);
+			if (tid >= 0) {
+				pss.occlusion.texture_id = tid;
 			}
 		}
 
@@ -2525,9 +2652,11 @@ static bool BuildTinyUsdScene (const aiScene* scene, tinyusdz::tydra::RenderScen
 static bool ExportSceneUsd (const aiScene* scene, const std::string& format, Result& result, const std::string& projectName, const MetadataOptions* metadata = nullptr, bool mergeSharedPositions = false)
 {
 #ifdef ASSIMPJS_ENABLE_TINYUSDZ
+	aiScene* mutableScene = const_cast<aiScene*> (scene);
+	PrepareStandardPbrTextureSlots (mutableScene);
 	tinyusdz::tydra::RenderScene renderScene;
 	std::string err;
-	if (!BuildTinyUsdScene (scene, renderScene, err, projectName, metadata, mergeSharedPositions)) {
+	if (!BuildTinyUsdScene (mutableScene, renderScene, err, projectName, metadata, mergeSharedPositions)) {
 		result.errorCode = ErrorCode::ExportError;
 		return false;
 	}
@@ -2761,6 +2890,9 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		assimpFormat = "stlb";
 	}
 	
+	if (isGltfOutput || isObjOutput) {
+		PrepareStandardPbrTextureSlots (mutableScene);
+	}
 	if (isGltfOutput) {
 		PrepareGltfPackedPbrTextures (mutableScene, sourceFiles, projectName);
 	}
