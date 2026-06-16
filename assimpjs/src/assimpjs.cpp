@@ -24,7 +24,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "../../assimp/contrib/meshoptimizer/meshoptimizer.h"
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../assimp/contrib/stb/stb_image.h"
@@ -309,161 +308,6 @@ static void ReleaseMeshAnimMeshes (aiMesh* mesh)
 	delete[] mesh->mAnimMeshes;
 	mesh->mAnimMeshes = nullptr;
 	mesh->mNumAnimMeshes = 0;
-}
-
-static bool SimplifyMeshForStl (aiMesh* mesh, float targetRatio, float targetError)
-{
-	if (mesh == nullptr || mesh->mVertices == nullptr || mesh->mFaces == nullptr) {
-		return false;
-	}
-	if (mesh->mNumVertices < 3 || mesh->mNumFaces < 2) {
-		return false;
-	}
-
-	std::vector<unsigned int> indices;
-	indices.reserve (static_cast<size_t> (mesh->mNumFaces) * 3);
-	for (unsigned int faceIndex = 0; faceIndex < mesh->mNumFaces; ++faceIndex) {
-		const aiFace& face = mesh->mFaces[faceIndex];
-		if (face.mNumIndices != 3 || face.mIndices == nullptr) {
-			return false;
-		}
-		for (unsigned int i = 0; i < 3; ++i) {
-			if (face.mIndices[i] >= mesh->mNumVertices) {
-				return false;
-			}
-			indices.push_back (face.mIndices[i]);
-		}
-	}
-
-	if (indices.size () < 6) {
-		return false;
-	}
-
-	size_t targetIndexCount = static_cast<size_t> (indices.size () * targetRatio);
-	targetIndexCount -= targetIndexCount % 3;
-	targetIndexCount = std::max<size_t> (3, targetIndexCount);
-	if (targetIndexCount >= indices.size ()) {
-		return false;
-	}
-
-	std::vector<unsigned int> simplifiedIndices (indices.size ());
-	size_t simplifiedIndexCount = meshopt_simplify (
-		simplifiedIndices.data (),
-		indices.data (),
-		indices.size (),
-		&(mesh->mVertices[0].x),
-		mesh->mNumVertices,
-		sizeof (aiVector3D),
-		targetIndexCount,
-		targetError,
-		meshopt_SimplifyLockBorder,
-		nullptr
-	);
-	if (simplifiedIndexCount >= indices.size ()) {
-		simplifiedIndexCount = meshopt_simplifySloppy (
-			simplifiedIndices.data (),
-			indices.data (),
-			indices.size (),
-			&(mesh->mVertices[0].x),
-			mesh->mNumVertices,
-			sizeof (aiVector3D),
-			targetIndexCount,
-			targetError,
-			nullptr
-		);
-	}
-	if (simplifiedIndexCount < 3 || simplifiedIndexCount >= indices.size ()) {
-		return false;
-	}
-
-	simplifiedIndices.resize (simplifiedIndexCount);
-	std::vector<aiVector3D> simplifiedVertices (mesh->mNumVertices);
-	const size_t simplifiedVertexCount = meshopt_optimizeVertexFetch (
-		simplifiedVertices.data (),
-		simplifiedIndices.data (),
-		simplifiedIndices.size (),
-		mesh->mVertices,
-		mesh->mNumVertices,
-		sizeof (aiVector3D)
-	);
-	if (simplifiedVertexCount < 3) {
-		return false;
-	}
-	simplifiedVertices.resize (simplifiedVertexCount);
-
-	aiVector3D* newVertices = new aiVector3D[simplifiedVertexCount];
-	for (size_t i = 0; i < simplifiedVertexCount; ++i) {
-		newVertices[i] = simplifiedVertices[i];
-	}
-
-	const unsigned int newFaceCount = static_cast<unsigned int> (simplifiedIndices.size () / 3);
-	aiFace* newFaces = new aiFace[newFaceCount];
-	for (unsigned int faceIndex = 0; faceIndex < newFaceCount; ++faceIndex) {
-		aiFace& face = newFaces[faceIndex];
-		face.mNumIndices = 3;
-		face.mIndices = new unsigned int[3];
-		face.mIndices[0] = simplifiedIndices[faceIndex * 3 + 0];
-		face.mIndices[1] = simplifiedIndices[faceIndex * 3 + 1];
-		face.mIndices[2] = simplifiedIndices[faceIndex * 3 + 2];
-	}
-
-	delete[] mesh->mVertices;
-	mesh->mVertices = newVertices;
-	delete[] mesh->mNormals;
-	mesh->mNormals = nullptr;
-	delete[] mesh->mTangents;
-	mesh->mTangents = nullptr;
-	delete[] mesh->mBitangents;
-	mesh->mBitangents = nullptr;
-	for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_COLOR_SETS; ++i) {
-		delete[] mesh->mColors[i];
-		mesh->mColors[i] = nullptr;
-	}
-	for (unsigned int i = 0; i < AI_MAX_NUMBER_OF_TEXTURECOORDS; ++i) {
-		delete[] mesh->mTextureCoords[i];
-		mesh->mTextureCoords[i] = nullptr;
-		mesh->mNumUVComponents[i] = 0;
-	}
-	ReleaseMeshTextureCoordNames (mesh);
-	ReleaseMeshBones (mesh);
-	ReleaseMeshAnimMeshes (mesh);
-	delete[] mesh->mFaces;
-	mesh->mFaces = newFaces;
-	mesh->mPrimitiveTypes = aiPrimitiveType_TRIANGLE;
-	mesh->mNumVertices = static_cast<unsigned int> (simplifiedVertexCount);
-	mesh->mNumFaces = newFaceCount;
-
-	aiVector3D minVertex = mesh->mVertices[0];
-	aiVector3D maxVertex = mesh->mVertices[0];
-	for (unsigned int i = 1; i < mesh->mNumVertices; ++i) {
-		const aiVector3D& vertex = mesh->mVertices[i];
-		minVertex.x = std::min (minVertex.x, vertex.x);
-		minVertex.y = std::min (minVertex.y, vertex.y);
-		minVertex.z = std::min (minVertex.z, vertex.z);
-		maxVertex.x = std::max (maxVertex.x, vertex.x);
-		maxVertex.y = std::max (maxVertex.y, vertex.y);
-		maxVertex.z = std::max (maxVertex.z, vertex.z);
-	}
-	mesh->mAABB.mMin = minVertex;
-	mesh->mAABB.mMax = maxVertex;
-	return true;
-}
-
-static bool SimplifySceneForStl (aiScene* scene)
-{
-	if (scene == nullptr || scene->mNumMeshes == 0 || scene->mMeshes == nullptr) {
-		return false;
-	}
-
-	constexpr float kTargetRatio = 0.5f;
-	constexpr float kTargetError = 1.0f;
-	bool simplified = false;
-	for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
-		if (SimplifyMeshForStl (scene->mMeshes[i], kTargetRatio, kTargetError)) {
-			simplified = true;
-		}
-	}
-	return simplified;
 }
 
 struct EmbeddedTextureFile
@@ -2926,10 +2770,6 @@ static bool ExportScene (const aiScene* scene, const std::string& format, Result
 		for (unsigned int i = 0; i < scene->mRootNode->mNumChildren; ++i) {
 			SyncMeshNamesFromNodes (scene->mRootNode->mChildren[i], mutableScene);
 		}
-	}
-
-	if (inputIsGltf && isStlOutput) {
-		SimplifySceneForStl (mutableScene);
 	}
 
 	if (format == "stl") {
